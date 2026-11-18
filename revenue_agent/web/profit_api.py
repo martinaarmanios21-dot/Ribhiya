@@ -8,13 +8,14 @@ import csv
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
 from .. import db
 from ..ledger.csv_import import csv_safe
 import time
 
-from ..profit import (advisor, diagnosis, ingest, memory, orders as orders_mod, outreach, quotes, simulator, store,
-                      tracking)
+from ..profit import (advisor, ai_policy, diagnosis, fx, ingest, memory, metrics, opportunities, orders as orders_mod, outreach,
+                      quotes, simulator, store, tracking)
 
 router = APIRouter(prefix="/api")
 MAX_FILES = 10
@@ -26,7 +27,13 @@ def _tenant(request: Request) -> str:
 
 
 def _actor(request: Request) -> str:
-    return "human:" + ((request.headers.get("x-tahsila-user") or "owner").strip()[:40] or "owner")
+    """Who did it, for the audit log. With tokens, the identity comes from the token (not a header anyone can set);
+    the optional display name is only appended."""
+    p = getattr(request.state, "principal", None)
+    name = ((request.headers.get("x-tahsila-user") or "owner").strip()[:40] or "owner")
+    if p and p.authenticated:
+        return f"{p.role}:{p.tenant}" + (f" ({name})" if name != "owner" else "")
+    return "human:" + name
 
 
 def _inv(conn, request: Request, iid: str) -> dict:
@@ -91,16 +98,19 @@ async def upload(iid: str, request: Request, files: list[UploadFile] = File(...)
         raise HTTPException(422, "overrides must be JSON") from exc
     if ov is not None and not isinstance(ov, dict):
         raise HTTPException(422, "overrides must be an object")
-    if replace_file_id:
-        try:
-            store.remove_file(conn, iid, replace_file_id, tenant=_tenant(request), actor=_actor(request))
-        except store.NotFound as exc:
-            raise HTTPException(404, "file_not_found") from exc
+    if replace_file_id and not conn.execute("SELECT 1 FROM inv_files WHERE id=? AND investigation_id=?",
+                                            (replace_file_id, iid)).fetchone():
+        raise HTTPException(404, "file_not_found")
     out = []
     for f in files:
         raw = await f.read(ingest.MAX_BYTES + 1)
-        out.append(store.add_file(conn, iid, f.filename or "upload", raw, tenant=_tenant(request),
-                                  actor=_actor(request), date_format=date_format, overrides=ov, confirm=confirm))
+        # parsing is CPU-bound: run it off the event loop so one big upload doesn't freeze other businesses
+        out.append(await run_in_threadpool(store.add_file, conn, iid, f.filename or "upload", raw,
+                                           tenant=_tenant(request), actor=_actor(request), date_format=date_format,
+                                           overrides=ov, confirm=confirm, replacing=replace_file_id))
+    if replace_file_id and out and all(r["status"] == "imported" for r in out):
+        # the old version is removed only after the corrected one imported, so a failed fix loses nothing
+        store.remove_file(conn, iid, replace_file_id, tenant=_tenant(request), actor=_actor(request))
     return {"results": out}
 
 
@@ -161,7 +171,8 @@ def plan(iid: str, request: Request, body: dict = Body(...)):
     f = next((x for x in (d or {}).get("findings", []) if x["driver"] == body.get("driver")), None)
     if f is None:
         raise HTTPException(409, "no current finding for that driver: recommendations need evidence first")
-    if body.get("option_key") not in diagnosis.OPTIONS.get(f["driver"], []):
+    offered = {o["key"] for o in (f.get("recommendation") or {}).get("options", [])}   # incl. measured options
+    if body.get("option_key") not in set(diagnosis.OPTIONS.get(f["driver"], [])) | offered:
         raise HTTPException(422, "unknown option for this finding")
     return tracking.create(conn, iid, tenant=_tenant(request), actor=_actor(request), finding=f,
                            option_key=body["option_key"], diagnosis=d)
@@ -278,6 +289,74 @@ def list_orders(iid: str, request: Request, filter: str = "all", product: str | 
             "missing": x["missing"], "complete": x["complete"], "refund_source": x["refund_source"]} for x in page]}
 
 
+@router.get("/profit/ai-settings")
+def get_ai_settings(request: Request):
+    return ai_policy.status(db.connect(), _tenant(request))
+
+
+@router.put("/profit/ai-settings")
+def put_ai_settings(request: Request, body: dict = Body(...)):
+    """The business chooses whether its figures may be sent to an AI provider (off = rule-based answers only)."""
+    if not isinstance(body.get("ai_enabled"), bool):
+        raise HTTPException(422, "ai_enabled must be true or false")
+    return ai_policy.set_enabled(db.connect(), _tenant(request), body["ai_enabled"], _actor(request))
+
+
+@router.delete("/profit/my-data")
+def erase_my_data(request: Request, body: dict = Body(...)):
+    """Erase all of this business's data (e.g. when it stops using Ribhiya). Needs {"confirm": "ERASE"}."""
+    if body.get("confirm") != "ERASE":
+        raise HTTPException(422, 'send {"confirm": "ERASE"} to erase all of this business\'s data')
+    return {"erased": store.erase_tenant(db.connect(), _tenant(request), _actor(request))}
+
+
+@router.get("/investigations/{iid}/opportunities")
+def revenue_opportunities(iid: str, request: Request, lang: str = "ar"):
+    """Win-back list, bundles and repeat-customer figures (local calculation; nothing is sent anywhere)."""
+    conn = db.connect()
+    _inv(conn, request, iid)
+    recs = store.records(conn, iid)
+    cur = diagnosis._main_currency(metrics.compute(recs))
+    if not cur:
+        raise HTTPException(409, "upload sales first")
+    return opportunities.compute(recs, cur, "en" if lang == "en" else "ar")
+
+
+@router.get("/investigations/{iid}/fx")
+def dollar_protection(iid: str, request: Request, lang: str = "ar"):
+    """Dollar protection: margin alert, protect-my-margin prices, restock warning (local calculation)."""
+    conn = db.connect()
+    inv = _inv(conn, request, iid)
+    recs = store.records(conn, iid)
+    cur = diagnosis._main_currency(metrics.compute(recs))
+    if not cur:
+        raise HTTPException(409, "upload sales first")
+    try:
+        settings = fx.validate((inv.get("settings") or {}).get("fx"))
+    except fx.FxError:
+        settings = None  # stored settings no longer valid: ask again instead of failing
+    return fx.compute(recs, cur, settings, "en" if lang == "en" else "ar")
+
+
+@router.put("/investigations/{iid}/fx")
+def set_dollar_rates(iid: str, request: Request, body: dict = Body(...)):
+    """Owner enters the dollar rate their costs were based on, today's rate, and which products follow the dollar."""
+    conn = db.connect()
+    inv = _inv(conn, request, iid)
+    try:
+        clean = fx.validate(body)
+    except fx.FxError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if clean is None:
+        raise HTTPException(422, "enter both the old and today's dollar rate")
+    from ..ledger.store import audit
+    with db.tx(conn):
+        store.touch(conn, iid, settings=(inv.get("settings") or {}) | {"fx": clean})
+        audit(conn, _actor(request), "fx_rates_set", tenant=_tenant(request), investigation=iid,
+              base_rate=clean["base_rate"], current_rate=clean["current_rate"])
+    return {"fx": clean}
+
+
 @router.post("/investigations/{iid}/simulate")
 def simulate(iid: str, request: Request, body: dict = Body(...)):
     conn = db.connect()
@@ -391,7 +470,7 @@ async def extract_quote(iid: str, request: Request, file: UploadFile = File(...)
     conn = db.connect()
     _inv(conn, request, iid)
     raw = await file.read(ingest.MAX_BYTES + 1)
-    return quotes.extract(file.filename or "quote", raw)
+    return await run_in_threadpool(quotes.extract, file.filename or "quote", raw)
 
 
 def _outreach_call(fn, *a, **k):

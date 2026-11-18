@@ -55,6 +55,22 @@ def build(conn, iid: str, st: dict, lang: str, tenant: str) -> list[dict]:
     outreach = outreach_mod.list_for(conn, iid)
     all_quotes = quotes_mod.list_for(conn, iid)
 
+    mismatch = st.get("currency_mismatch")
+    if mismatch:  # costs in another currency match no sale: every order would look 100% profitable
+        costs, sales = ", ".join(mismatch["cost_currencies"]), mismatch["sales_currency"]
+        acts.append({"kind": "currency_mismatch", "evidence": "product_costs", "trigger": {
+            "en": f"product costs are in {costs}, sales are in {sales}",
+            "ar": f"تكلفة المنتجات بالعملة {costs} والمبيعات بالعملة {sales}"}[lang],
+            "title": {"en": "Your product costs and sales use different currencies",
+                      "ar": "تكلفة المنتجات والمبيعات بعملتين مختلفتين"}[lang],
+            "why": {"en": "I never mix currencies, so no product got a cost and profit looks far too high.",
+                    "ar": "أنا مش بخلط العملات، فمفيش منتج اتحسبت تكلفته والربح باين أعلى بكتير من الحقيقة."}[lang],
+            "expected": {"en": "Sales and costs in the same currency.", "ar": "المبيعات والتكاليف بنفس العملة."}[lang],
+            "impact": None,
+            "next": {"en": "If the sales file has no currency column, set the investigation currency to "
+                           f"{mismatch['cost_currencies'][0]} (or fix the currency in the costs file) and upload again.",
+                     "ar": "لو ملف المبيعات مفيهوش عمود عملة، غيّر عملة التحقيق لـ "
+                           f"{mismatch['cost_currencies'][0]} (أو صحّح العملة في ملف التكاليف) وارفع تاني."}[lang]})
     for ev in [e for e in st.get("evidence", []) if e["status"] == "missing"][:2]:
         acts.append({"kind": "document", "evidence": ev["key"], "trigger": ev["trigger"][lang],
                      "title": ev["label"][lang], "why": T["document"]["why"][lang], "expected": ev["question"][lang],

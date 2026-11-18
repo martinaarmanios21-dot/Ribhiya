@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { toast } from "sonner";
 import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { CatTick, catWidth, useNarrow } from "./charts";
 import { Card, Pill, Spinner, useErrorToast } from "./bits";
 import { major, useIT } from "./charts";
 import { useApp } from "@/lib/app-context";
@@ -14,6 +15,7 @@ const vizCss = `.viz2{--s1:#2a78d6;--s2:#eb6834;--grid:#e7e5df;--ink2:#52514e}.d
 const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 0 });
 
 export function OrderProfit({ ov, id }: { ov: any; id: string }) {
+  const narrow = useNarrow();
   const it = useIT();
   const { money, lang } = useApp();
   const qc = useQueryClient();
@@ -42,12 +44,12 @@ export function OrderProfit({ ov, id }: { ov: any; id: string }) {
           <style>{vizCss}</style>
           <figcaption className="text-sm font-bold">{it("ch_products_contrib")}</figcaption>
           <div className="text-xs text-muted-foreground">{cur} · {it("ch_products_contrib_note")}</div>
-          <div dir="ltr" className="h-64">
+          <div dir="ltr" className="h-64" style={narrow ? { height: Math.max(256, chartData.length * 44 + 70) } : undefined}>
             <ResponsiveContainer>
               <BarChart data={chartData} layout="vertical" margin={{ top: 4, right: 30, left: 10, bottom: 0 }} barGap={2}>
                 <CartesianGrid stroke="var(--grid)" horizontal={false} />
                 <XAxis type="number" tick={{ fontSize: 11, fill: "var(--ink2)" }} tickFormatter={fmt} axisLine={false} tickLine={false} />
-                <YAxis type="category" dataKey="k" width={110} tick={{ fontSize: 11, fill: "var(--ink2)" }} axisLine={false} tickLine={false} />
+                <YAxis type="category" dataKey="k" width={catWidth(narrow)} tick={<CatTick narrow={narrow} />} axisLine={false} tickLine={false} interval={0} />
                 <Tooltip formatter={(x: number) => fmt(x)} />
                 <Legend />
                 <Bar dataKey="sales" name={it("op_net")} fill="var(--s1)" radius={[0, 4, 4, 0]} barSize={10} />
@@ -185,7 +187,7 @@ export function Simulator({ ov, id, scenarios }: { ov: any; id: string; scenario
   const input = "w-28 rounded-lg border bg-card px-2 py-1.5 text-sm";
   const Field = ({ k, label, cap, children }: { k: string; label: string; cap: string; children?: React.ReactNode }) => (
     <label className={cn("flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2", caps[cap]?.ok ? "bg-muted/50" : "bg-muted/20 opacity-70")}>
-      <span className="text-sm">{label}{!caps[cap]?.ok && <span className="block text-xs text-warning">{it("sim_not_supported")} {caps[cap]?.reason}</span>}</span>
+      <span className="text-sm">{label}{!caps[cap]?.ok && <span className="block text-xs text-warning">{it("sim_not_supported")} {(lang === "ar" && caps[cap]?.reason_ar) || caps[cap]?.reason}</span>}</span>
       <span className="flex items-center gap-1">{children}{k && <input disabled={!caps[cap]?.ok} inputMode="decimal" value={f[k] ?? ""} onChange={(e) => setF({ ...f, [k]: e.target.value })} className={input} dir="ltr" />}</span>
     </label>
   );
@@ -197,25 +199,25 @@ export function Simulator({ ov, id, scenarios }: { ov: any; id: string; scenario
       <label className="mb-2 flex items-center gap-2 text-sm">{it("sim_month")}
         <select value={period} onChange={(e) => setPeriod(e.target.value)} className="rounded border bg-card px-2 py-1">{ov.simulator.periods.map((p: string) => <option key={p}>{p}</option>)}</select></label>
       <div className="grid gap-2 md:grid-cols-2">
-        <Field k="price" label={it("sim_price")} cap="price_change_pct">
+        {Field({ k: "price", label: it("sim_price"), cap: "price_change_pct", children: (<>
           <select value={f.priceProduct} onChange={(e) => setF({ ...f, priceProduct: e.target.value })} className="rounded border bg-card px-1 py-1 text-xs">
             <option value="all">{it("sim_all_products")}</option>{ov.products.map((p: any) => <option key={p.product} value={p.product}>{p.product}</option>)}
           </select>
-        </Field>
-        <Field k="packaging" label={`${it("sim_packaging")} (${cur})`} cap="packaging_per_order" />
-        <Field k="shipping" label={`${it("sim_shipping")} (${cur})`} cap="shipping_per_order" />
-        <Field k="discount" label={it("sim_discount")} cap="discount_pct" />
-        <Field k="returns" label={it("sim_returns")} cap="return_rate_pct" />
-        <Field k="unitCost" label={`${it("sim_unit_cost")} (${cur})`} cap="product_unit_cost">
+        </>) })}
+        {Field({ k: "packaging", label: `${it("sim_packaging")} (${cur})`, cap: "packaging_per_order" })}
+        {Field({ k: "shipping", label: `${it("sim_shipping")} (${cur})`, cap: "shipping_per_order" })}
+        {Field({ k: "discount", label: it("sim_discount"), cap: "discount_pct" })}
+        {Field({ k: "returns", label: it("sim_returns"), cap: "return_rate_pct" })}
+        {Field({ k: "unitCost", label: `${it("sim_unit_cost")} (${cur})`, cap: "product_unit_cost", children: (<>
           <select value={f.unitProduct ?? ""} onChange={(e) => setF({ ...f, unitProduct: e.target.value })} className="rounded border bg-card px-1 py-1 text-xs" disabled={!caps.product_unit_cost?.ok}>
             <option value="">—</option>{(caps.product_unit_cost?.products ?? []).map((p: string) => <option key={p}>{p}</option>)}
           </select>
-        </Field>
-        <Field k="threshold" label={`${it("sim_free_ship")} (${cur})`} cap="free_shipping">
+        </>) })}
+        {Field({ k: "threshold", label: `${it("sim_free_ship")} (${cur})`, cap: "free_shipping", children: (<>
           <span className="text-xs">{it("sim_fee_below")}</span>
           <input disabled={!caps.free_shipping?.ok} value={f.fee ?? ""} onChange={(e) => setF({ ...f, fee: e.target.value })} className="w-16 rounded-lg border bg-card px-2 py-1.5 text-sm" dir="ltr" />
-        </Field>
-        <Field k="volume" label={it("sim_volume")} cap="volume_change_pct" />
+        </>) })}
+        {Field({ k: "volume", label: it("sim_volume"), cap: "volume_change_pct" })}
       </div>
       <button className="btn btn-primary mt-3 !py-2" disabled={busy || !Object.keys(scenario()).length} onClick={run}>{it("sim_run")}</button>
       <Spinner show={busy} />
@@ -228,7 +230,7 @@ export function Simulator({ ov, id, scenarios }: { ov: any; id: string; scenario
               <tbody>{rows.map((k) => (
                 <tr key={k}><td className="border-b px-2 py-1">{it(`m_${k}`)}</td><td className="border-b px-2 py-1 tabular-nums" dir="ltr">{show(k, res.baseline[k])}</td>
                   <td className="border-b px-2 py-1 tabular-nums" dir="ltr">{show(k, res.projected[k])}</td>
-                  <td className={cn("border-b px-2 py-1 tabular-nums", (res.delta[k] ?? 0) < 0 ? "text-danger" : "text-success")} dir="ltr">{k === "contribution_margin" || res.delta[k] == null ? "" : (res.delta[k] > 0 ? "+" : "") + show(k, res.delta[k])}</td></tr>))}</tbody>
+                  <td className={cn("border-b px-2 py-1 tabular-nums", ((["loss_orders", "break_even_orders"].includes(k) ? -1 : 1) * (res.delta[k] ?? 0)) < 0 ? "text-danger" : "text-success")  /* fewer losing orders / a lower break-even = good */} dir="ltr">{k === "contribution_margin" || res.delta[k] == null ? "" : (res.delta[k] > 0 ? "+" : "") + show(k, res.delta[k])}</td></tr>))}</tbody>
             </table>
           </div>
           <div className="text-sm"><b>{it("sim_assumptions")}:</b><ul className="mt-1 list-disc ps-5 text-muted-foreground" dir="ltr" style={{ textAlign: "start" }}>{res.assumptions.map((a: string) => <li key={a}>{a}</li>)}</ul></div>

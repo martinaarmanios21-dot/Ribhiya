@@ -235,7 +235,7 @@ def test_explanation_numbers_match_calculations_in_both_languages(conn, inv):
         assert f["driver"] == "packaging" and marker in e["evidence"]
         assert ("25.00" in e["evidence"]) and ("1,080.00" in e["why"])
         assert all(k in e for k in ("what", "why", "evidence", "next"))
-    assert "بيسيبلك" in diagnosis.state(conn, inv, T, "ar")["diagnosis"]["findings"][0]["explanation"]["what"]
+    assert "بتخسر" in diagnosis.state(conn, inv, T, "ar")["diagnosis"]["findings"][0]["explanation"]["what"]
 
 
 def test_charts_come_from_the_same_calculation(conn, inv):

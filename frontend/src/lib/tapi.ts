@@ -96,6 +96,15 @@ export const papi2 = {
     req<any>(`/api/investigations/${encodeURIComponent(id)}/scenarios`, post({ scenario, period, name, track, lang })),
 };
 
+export const xapi = {
+  opportunities: (id: string, lang: string) => req<any>(`/api/investigations/${encodeURIComponent(id)}/opportunities?lang=${lang}`),
+  fx: (id: string, lang: string) => req<any>(`/api/investigations/${encodeURIComponent(id)}/fx?lang=${lang}`),
+  setFx: (id: string, body: Record<string, unknown>) => req<any>(`/api/investigations/${encodeURIComponent(id)}/fx`, { method: "PUT", body: JSON.stringify(body) }),
+  aiSettings: () => req<any>("/api/profit/ai-settings"),
+  setAi: (on: boolean) => req<any>("/api/profit/ai-settings", { method: "PUT", body: JSON.stringify({ ai_enabled: on }) }),
+  eraseAll: () => req<any>("/api/profit/my-data", { method: "DELETE", body: JSON.stringify({ confirm: "ERASE" }) }),
+};
+
 export const qapi = {
   list: (id: string) => req<any[]>(`/api/investigations/${encodeURIComponent(id)}/quotes`),
   add: (id: string, body: Record<string, unknown>) => req<any>(`/api/investigations/${encodeURIComponent(id)}/quotes`, post(body)),

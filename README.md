@@ -9,7 +9,7 @@
 
 *Finds the leak · **test any decision before you spend a pound** · teaches you the business*
 
-*Built with [Hermes Agent](https://github.com/NousResearch/hermes-agent) · every number calculated, never invented · 145 tests*
+*Built with [Hermes Agent](https://github.com/NousResearch/hermes-agent) · every number calculated, never invented · 189 tests · checked on a real retail export*
 watch the demo video here: https://app.arcade.software/share/8zBDChTmR5Vrhnzs5UR7
 
 </div>
@@ -164,7 +164,7 @@ calculations, and always says which one answered.
 The AI only puts numbers into words. Every figure comes from deterministic Python code, traceable to the file and
 row it came from:
 
-- **145 automated tests**, including hand-calculated expected values, "the causes add up exactly to the change",
+- **189 automated tests**, including hand-calculated expected values, "the causes add up exactly to the change",
   "a projection never becomes a result", and AI-output checks with a fake provider.
 - **A fictional test pack** (`test-data/tahseela-test-pack/`) whose expected results are written down in advance in
   [docs/TEST_GUIDE.md](docs/TEST_GUIDE.md): −23.74 discounts per order, 14 of 260 orders losing money, a what-if
@@ -190,6 +190,28 @@ More: [docs/PROFIT_INVESTIGATION.md](docs/PROFIT_INVESTIGATION.md) (workflow, He
 [docs/SECURITY.md](docs/SECURITY.md) · [docs/HACKATHON_READINESS.md](docs/HACKATHON_READINESS.md)
 
 ---
+
+## «زوّد مبيعاتك» (Grow sales): win back customers, and measure it honestly
+
+If the sales file has a customer column (name or phone), the **Grow sales** tab lists repeat customers who have
+gone quiet for longer than *their own* usual gap, with a ready Egyptian-Arabic WhatsApp message the owner copies
+(nothing is sent automatically, and customer data never goes to an AI). It also shows the repeat-customer rate, how
+much the top 20% of customers bring, and products customers already buy together (bundle ideas).
+
+**It proves its own value.** About 30% of the list is set aside as a comparison group that gets no message. After
+the next month's sales are uploaded, Ribhiya compares how many came back in each group and reports the extra sales
+only when the difference is larger than chance (two-proportion test, at least 20 customers per group). Otherwise it
+says "no clear effect yet". On the real test data it correctly reported no effect when no messages had been sent:
+about half of "lapsed" customers come back on their own, which is exactly why the comparison group exists.
+
+## Checked on real data
+
+On 146,252 rows of a real online retailer's export (UCI Online Retail II, Aug–Oct 2011), every monthly figure matches
+an independent recalculation exactly, the raw export imports **without manual preparation** (credit notes become
+returns, postage becomes delivery income, Amazon/bank fees become costs, manual adjustments are reported, not
+guessed), and the diagnosis names the real causes (like-for-like price cuts, one wholesale return flagged as a
+possible one-off). Reproduce it with [evals/real_data/](evals/real_data/README.md); the regression tests are in
+`tests/test_real_data_fixes.py`.
 
 ## Chat with Ribhiya (in-app guide)
 
@@ -228,7 +250,7 @@ Optional configuration (`.env`, see `.env.example`): an LLM key (`GEMINI_API_KEY
 SMTP for sending approved supplier requests (`EMAIL_SENDING_ENABLED=1`, `SMTP_*`), `ADMIN_TOKEN` for any shared
 deployment.
 
-Tests: `uv run pytest -q` (145 tests: profit investigation, in-app guide, evidence and supplier outreach, order profit, simulator, quotes, security, plus the simulation lab). Frontend: `cd frontend && npx vitest run`. MCP server with the read-only profit tools: `uv run python -m revenue_agent.mcp_server`.
+Tests: `uv run pytest -q` (189 tests: profit investigation, in-app guide, evidence and supplier outreach, order profit, simulator, quotes, security, plus the simulation lab). Frontend: `cd frontend && npx vitest run`. MCP server with the read-only profit tools: `uv run python -m revenue_agent.mcp_server`.
 
 > **Collections was removed (2026-10-10).** The former invoice-collections workflow (invoice import, overdue
 > analysis, follow-up emails, its chat agent, pages and API) is gone. The shared pieces it had (value parsing,
@@ -305,7 +327,11 @@ Read more:
   real provider in this repository. Without SMTP configured, Ribhiya only drafts and copies.
 - Files are uploaded by hand (CSV, Excel, text PDF); there is no live accounting or store connector, and no OCR for
   scanned PDFs.
-- Single-user app; set `ADMIN_TOKEN` before exposing it. The MCP HTTP transport has no built-in auth.
+- Multi-business hosting uses static per-business tokens (`TENANT_TOKENS`); there are no user accounts or logins
+  yet. Settings that are present but invalid fail closed. The MCP HTTP transport has no built-in auth.
+- Product unit costs are one list (not dated), so a supplier price rise shows up only when the cost list is updated;
+  month-to-month changes in product cost per order are attributed to *what customers buy* unless the same product's
+  cost changed.
 - The Wesam package in docs/WESAM_PACKAGE.md describes the removed collections agent and is out of date.
 
 ## Front end

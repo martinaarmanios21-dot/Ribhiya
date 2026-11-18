@@ -310,3 +310,34 @@ def test_owner_confirmation_clears_inferred_categories(conn):
     assert again["summary"]["tables"][0]["needs_confirmation"] == []
     rec = store.records(conn, iid)[0]
     assert rec["category"] == "shipping" and "category_owner_confirmed" in rec["flags"]
+
+
+def test_daily_send_cap_per_business_reply_to_and_single_line_subject(conn, monkeypatch):
+    sent = []
+    for k, v in {"EMAIL_SENDING_ENABLED": "1", "SMTP_HOST": "smtp.test", "SMTP_FROM": "noreply@platform.test",
+                 "SMTP_STARTTLS": "0", "OUTREACH_DAILY_CAP": "1"}.items():
+        monkeypatch.setenv(k, v)
+
+    class Fake:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def send_message(self, msg):
+            sent.append(msg)
+            return {}
+    monkeypatch.setattr(smtplib, "SMTP", Fake)
+    s, c, e = cosmetics()
+    iid = new_inv(conn, [("s.csv", s), ("c.csv", c), ("e.csv", e)])
+    o = _ready(conn, iid)
+    o = outreach.update(conn, iid, o["id"], tenant=T, actor="o", subject="Quote\r\nBcc: x@evil.test",
+                        brief={"reply_to": "owner@beauty.test"})
+    assert "\n" not in o["subject"] and "\r" not in o["subject"]
+    with pytest.raises(outreach.OutreachError, match="reply-to"):
+        outreach.update(conn, iid, o["id"], tenant=T, actor="o", brief={"reply_to": "not-an-email"})
+    o = outreach.approve(conn, iid, o["id"], tenant=T, actor="o")
+    outreach.send(conn, iid, o["id"], tenant=T, actor="o", approval=o["approval_hash"])
+    assert sent[0]["Reply-To"] == "owner@beauty.test" and sent[0]["Bcc"] is None
+    o2 = outreach.approve(conn, iid, _ready(conn, iid)["id"], tenant=T, actor="o")
+    with pytest.raises(outreach.OutreachError, match="daily limit of 1"):
+        outreach.send(conn, iid, o2["id"], tenant=T, actor="o", approval=o2["approval_hash"])
+    assert len(sent) == 1

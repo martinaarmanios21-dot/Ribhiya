@@ -27,7 +27,7 @@ MIN_ORDERS = 30
 MIN_IMPROVEMENT = 0.05      # ≥5% lower per-order cost counts as a measurable improvement
 MAX_AOV_SHIFT = 0.15        # bigger changes in average order value make the comparison not like-for-like
 MAX_MIX_SHIFT = 0.15        # change in the top product's share of units
-FIELD = {"product_costs": "cogs", "price_and_mix": "gross_sales"}
+FIELD = {"product_costs": "cogs", "price_and_mix": "gross_sales", "basket_size": "units"}
 
 
 def _field(driver: str) -> str:
@@ -173,7 +173,7 @@ def verify(conn: sqlite3.Connection, iid: str, xid: int, *, tenant: str, actor: 
         post_rr = sum(rr) / len(rr) if rr else None
         base = x["baseline"]
         change = metrics._ratio(post - base["per_order"], base["per_order"]) if base["per_order"] else None
-        cost_like = x["driver"] not in ("price_and_mix", "shipping_income")
+        cost_like = x["driver"] not in ("price_and_mix", "shipping_income", "basket_size")
         improved = change is not None and ((change <= -MIN_IMPROVEMENT) if cost_like else (change >= MIN_IMPROVEMENT))
         mix_after = _mix(recs, x["currency"], x["implemented_on"], None)
         top = max(base["mix"], key=base["mix"].get) if base["mix"] else None

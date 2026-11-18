@@ -20,7 +20,11 @@ from ..ledger.csv_import import (CURRENCY_EXPONENT, _norm_header, decode, parse_
                                  parse_date)
 
 MAX_BYTES = 10_000_000
-MAX_ROWS = 20_000
+MAX_ROWS = 100_000          # one month of a busy shop (the real test export had 60k lines/month)
+MAX_COLS = 200
+MAX_XLSX_UNZIPPED = 100_000_000   # an .xlsx is a zip: refuse "zip bombs" before opening them
+MAX_XLSX_RATIO = 200
+MAX_SHEETS = 20
 MAX_CELL = 500
 SUPPORTED = {".csv": "csv", ".txt": "csv", ".xlsx": "xlsx", ".xlsm": "xlsx", ".pdf": "pdf"}
 
@@ -28,20 +32,30 @@ SUPPORTED = {".csv": "csv", ".txt": "csv", ".xlsx": "xlsx", ".xlsm": "xlsx", ".p
 TYPES: dict[str, dict[str, dict]] = {
     "sales": {
         "order_id": {"required": True, "aliases": ["order_id", "order", "order no", "order number", "order #",
-                                                   "invoice", "invoice no", "رقم الطلب", "الطلب", "رقم الأوردر"]},
+                                                   "invoice", "invoice no", "رقم الطلب", "الطلب", "رقم الأوردر",
+                                                   "name"]},  # Shopify's order export calls the order number "Name"
         "date": {"required": True, "aliases": ["date", "order date", "created at", "created_at", "sale date",
+                                               "invoicedate", "invoice date", "order created", "paid at",
                                                "تاريخ", "التاريخ", "تاريخ الطلب"]},
         "product": {"aliases": ["product", "sku", "item", "product name", "item name", "lineitem name",
-                                "lineitem sku", "المنتج", "الصنف", "اسم المنتج", "كود المنتج"]},
+                                "lineitem sku", "stockcode", "stock code", "item code", "product code",
+                                "المنتج", "الصنف", "اسم المنتج", "كود المنتج"]},
         "quantity": {"aliases": ["quantity", "qty", "units", "lineitem quantity", "الكمية", "العدد"]},
         "unit_price": {"aliases": ["unit price", "price", "lineitem price", "سعر الوحدة", "السعر"]},
         "revenue": {"aliases": ["revenue", "sales", "line total", "subtotal", "gross sales", "total", "amount",
                                 "الإجمالي", "الاجمالي", "المبيعات", "قيمة الطلب"]},
-        "discount": {"aliases": ["discount", "discount amount", "discounts", "lineitem discount", "خصم", "الخصم"]},
+        "discount": {"aliases": ["discount", "discount amount", "discounts", "lineitem discount", "cart discount",
+                                 "coupon amount", "خصم", "الخصم"]},
+        "description": {"score": False, "aliases": ["description", "item description", "product description",
+                                                    "الوصف", "وصف المنتج"]},
+        "customer": {"score": False, "aliases": ["customer", "customer id", "customer name", "customer email", "customer phone",
+                                 "client", "buyer", "email", "phone", "العميل", "اسم العميل", "رقم العميل",
+                                 "تليفون العميل", "موبايل العميل"]},
         "channel": {"aliases": ["channel", "sales channel", "source", "platform", "القناة", "منصة البيع"]},
         "status": {"aliases": ["status", "order status", "financial status", "الحالة", "حالة الطلب"]},
         "shipping_charged": {"aliases": ["shipping charged", "shipping paid", "delivery fee charged", "shipping fee",
-                                         "shipping income", "رسوم التوصيل", "الشحن المدفوع", "مصاريف الشحن على العميل"]},
+                                         "shipping income", "order shipping", "shipping amount", "shipping",
+                                         "رسوم التوصيل", "الشحن المدفوع", "مصاريف الشحن على العميل"]},
         "currency": {"aliases": ["currency", "العملة"]},
     },
     "product_costs": {
@@ -98,6 +112,7 @@ _CATEGORY_WORDS: list[tuple[str, tuple[str, ...]]] = [
     ("shipping", ("shipping", "delivery", "courier", "freight", "postage", "bosta", "aramex", "mylerz", "dhl",
                   "fedex", "شحن", "توصيل", "مندوب", "بوسطة", "أرامكس")),
     ("payment_fees", ("payment fee", "processing", "paymob", "fawry", "stripe", "paypal", "gateway", "card fee",
+                      "bank charge",
                       "رسوم دفع", "فوري", "بوابة دفع")),
     ("marketplace_fees", ("commission", "marketplace", "amazon", "noon", "jumia", "etsy", "عمولة", "نون", "جوميا")),
     ("marketing", ("marketing", "ads", "advert", "facebook", "instagram", "meta", "google ads", "tiktok",
@@ -122,7 +137,13 @@ class Issue:
     severity: str = "error"  # error (row rejected) | warning (row kept, flagged)
 
     def as_dict(self) -> dict:
-        return self.__dict__.copy()
+        from .messages_ar import ar
+        return self.__dict__.copy() | {"message_ar": ar(self.message)}
+
+
+def _ar(message: str | None) -> str | None:
+    from .messages_ar import ar
+    return ar(message)
 
 
 @dataclass
@@ -141,7 +162,8 @@ class TableResult:
     def summary(self) -> dict:
         return {"sheet": self.sheet, "headers": self.headers, "detected_type": self.detected_type,
                 "type_scores": self.type_scores, "mapping": self.mapping, "missing_required": self.missing_required,
-                "needs_confirmation": self.needs_confirmation, "rows_total": self.rows_total,
+                "needs_confirmation": self.needs_confirmation,
+                "needs_confirmation_ar": [_ar(n) for n in self.needs_confirmation], "rows_total": self.rows_total,
                 "rows_valid": len(self.records), "rows_rejected": len({(i.row) for i in self.issues
                                                                         if i.severity == "error"}),
                 "issues": [i.as_dict() for i in self.issues[:300]], "issue_count": len(self.issues),
@@ -160,10 +182,26 @@ class FileResult:
 
     def summary(self) -> dict:
         return {"filename": self.filename, "kind": self.kind, "sha256": self.sha256, "fatal": self.fatal,
+                "fatal_ar": _ar(self.fatal),
                 "tables": [t.summary() for t in self.tables], "text_preview": self.text_preview}
 
 
 # ------------------------------------------------------------------------------------------ readers
+
+def _check_xlsx_zip(raw: bytes) -> None:
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            infos = z.infolist()
+    except zipfile.BadZipFile as exc:
+        raise ValueError("this is not a valid .xlsx workbook (old .xls files are not supported: save as .xlsx)") from exc
+    total = sum(i.file_size for i in infos)
+    sheets = sum(1 for i in infos if i.filename.startswith("xl/worksheets/") and i.filename.endswith(".xml"))
+    if total > MAX_XLSX_UNZIPPED or total > MAX_XLSX_RATIO * max(len(raw), 1):
+        raise ValueError("the workbook expands to far more data than its size suggests; save it as CSV and upload that")
+    if sheets > MAX_SHEETS:
+        raise ValueError(f"the workbook has more than {MAX_SHEETS} sheets; upload only the sheets you need")
+
 
 def _cell(v) -> str:
     if v is None:
@@ -192,10 +230,16 @@ def read_tables(filename: str, raw: bytes) -> tuple[str | None, list[tuple[str, 
             dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
         except csv.Error:
             dialect = csv.excel
-        return kind, [("csv", [[_cell(c) for c in row] for row in csv.reader(io.StringIO(text), dialect)])], None
+        rows = []
+        for i, row in enumerate(csv.reader(io.StringIO(text), dialect)):
+            if i > MAX_ROWS + 1:
+                break
+            rows.append([_cell(c) for c in row[:MAX_COLS]])
+        return kind, [("csv", rows)], None
     if kind == "xlsx":
         if not raw.startswith(b"PK"):
             raise ValueError("this is not a valid .xlsx workbook (old .xls files are not supported: save as .xlsx)")
+        _check_xlsx_zip(raw)
         import openpyxl
         try:
             wb = openpyxl.load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
@@ -207,7 +251,7 @@ def read_tables(filename: str, raw: bytes) -> tuple[str | None, list[tuple[str, 
             for i, r in enumerate(ws.iter_rows(values_only=True)):
                 if i > MAX_ROWS + 1:
                     break
-                rows.append([_cell(c) for c in r])
+                rows.append([_cell(c) for c in r[:MAX_COLS]])
             sheets.append((ws.title[:60], rows))
         wb.close()
         return kind, sheets, None
@@ -257,12 +301,18 @@ def map_columns(headers: list[str], rtype: str) -> dict[str, str]:
     mapping, used = {}, set()
     normed = {h: _norm_header(h) for h in headers if h}
     for fname, spec in TYPES[rtype].items():
-        aliases = [_norm_header(a) for a in spec["aliases"]]
-        for h, n in normed.items():  # exact alias first
-            if h not in used and n in aliases:
+        # aliases in priority order: "order id" beats a generic "name" whatever the column order
+        for alias in (_norm_header(a) for a in spec["aliases"]):
+            h = next((h for h, n in normed.items() if h not in used and n == alias), None)
+            if h:
                 mapping[fname] = h
                 used.add(h)
                 break
+    if rtype == "sales" and {"unit_price", "quantity"} <= set(mapping) and \
+            _norm_header(mapping.get("revenue", "")) in ("total", "subtotal", "amount"):
+        # an order-level total (e.g. Shopify's Total, which includes delivery and sits on the first line only)
+        # is not a line amount: price × quantity is
+        mapping.pop("revenue")
     return mapping
 
 
@@ -277,7 +327,8 @@ def detect_type(headers: list[str]) -> tuple[str | None, dict[str, float], list[
             scores[rtype] = 0.0  # a sales table must say what the customer paid
             continue
         hint = sum(w in low for w in TYPE_HINTS[rtype])
-        scores[rtype] = round(len(m) / len(spec) + 0.15 * hint, 3)
+        scored = [f for f, s in spec.items() if s.get("score", True)]  # optional extras don't dilute the score
+        scores[rtype] = round(len([f for f in m if f in scored]) / len(scored) + 0.15 * hint, 3)
     ranked = sorted(scores.items(), key=lambda kv: -kv[1])
     notes = []
     if not ranked or ranked[0][1] == 0:
@@ -317,6 +368,82 @@ def _num(raw: str, exp: int, field_name: str, issues: list, sheet: str, row: int
     return v
 
 
+_DELIVERY_WORDS = {"post", "postage", "carriage", "shipping", "delivery", "shipping fee", "delivery fee",
+                   "delivery charge", "shipping charge", "dotcom postage", "شحن", "الشحن", "توصيل", "التوصيل",
+                   "مصاريف الشحن", "رسوم التوصيل", "رسوم الشحن"}
+_DISCOUNT_WORDS = {"discount", "coupon", "promo", "voucher", "خصم", "الخصم", "كوبون", "قسيمة"}
+_ADJUST_WORDS = {"manual", "adjustment", "adjust", "adjust bad debt", "تسوية", "تعديل"}
+
+
+def _id(raw: str) -> str:
+    """IDs that went through Excel come back as numbers: 15365 -> '15365.0'. Undo that (only for whole numbers)."""
+    return raw[:-2] if re.fullmatch(r"\d+\.0", raw or "") else raw
+
+
+def _negative(raw: str) -> bool:
+    raw = (raw or "").strip().replace(",", "")
+    if raw.startswith("(") and raw.endswith(")"):
+        raw = "-" + raw[1:-1]
+    try:
+        return float(raw.replace("−", "-")) < 0
+    except ValueError:
+        return False
+
+
+def _fee_line(product: str | None) -> str | None:
+    """Fee/commission lines (e.g. 'AMAZON FEE', 'Bank Charges', 'CRUK Commission') -> their cost category."""
+    p = (product or "").lower()
+    if not any(w in p for w in ("fee", "commission", "charge", "عمولة", "رسوم")):
+        return None
+    cat, _ = categorize("", p, "")
+    return cat if cat in ("payment_fees", "marketplace_fees") else None
+
+
+def _special_line(product: str | None) -> str | None:
+    """Lines in an order export that are not products: delivery charges, discount lines, manual adjustments."""
+    p = re.sub(r"\s+", " ", (product or "").strip().lower())
+    if p in _DELIVERY_WORDS or "postage" in p or "carriage" in p:
+        return "delivery"
+    if p in _DISCOUNT_WORDS:
+        return "discount"
+    if p in _ADJUST_WORDS:
+        return "adjustment"
+    return None
+
+
+def _attach_order_lines(res: "TableResult", extra: dict, sheet: str) -> None:
+    """Fold delivery/discount lines into their order's first product line, and check each order's total discount
+    against its total sales (a discount may be typed on one line, but can't exceed the whole order)."""
+    first: dict[str, dict] = {}
+    for r in res.records:
+        if r["type"] == "sales":
+            first.setdefault(r["order_id"], r)
+    for kind, by_order in extra.items():
+        for oid, items in by_order.items():
+            amount = sum(a for _, a in items)
+            target = first.get(oid)
+            if target is None:
+                res.issues.append(Issue(sheet, items[0][0], "product", f"{kind}_only_order",
+                                        f"order {oid} has only a {kind} line and no products; skipped", "warning"))
+                continue
+            if kind == "delivery":
+                target["shipping_charged_minor"] = (target.get("shipping_charged_minor") or 0) + amount
+            else:
+                target["discount_minor"] += abs(amount)
+    totals: dict[str, list[int]] = {}
+    for r in res.records:
+        if r["type"] == "sales":
+            t = totals.setdefault(r["order_id"], [0, 0])
+            t[0] += r["gross_minor"]
+            t[1] += r["discount_minor"]
+    bad = {oid for oid, (g, d) in totals.items() if d > g}
+    if bad:
+        for r in [r for r in res.records if r["type"] == "sales" and r["order_id"] in bad]:
+            res.issues.append(Issue(sheet, r["row"], "discount", "discount_exceeds_revenue",
+                                    "the order's discounts are larger than the order itself"))
+        res.records = [r for r in res.records if not (r["type"] == "sales" and r["order_id"] in bad)]
+
+
 def _qty(raw: str, issues: list, sheet: str, row: int) -> float | None:
     if not raw:
         return None
@@ -343,6 +470,8 @@ def normalise(sheet: str, headers: list[str], rows: list[list[str]], rtype: str,
         return res
     idx = {f: headers.index(h) for f, h in mapping.items() if h in headers}
     seen: dict[tuple, int] = {}
+    extra: dict[str, dict[str, list]] = {"delivery": {}, "discount": {}}  # order_id -> [(row, amount)]
+    adjustments: list[tuple[int, int]] = []  # manual adjustment lines (row, signed amount): left out, reported
     for n, cells in enumerate(rows, start=first_row):
         if not any(c for c in cells):
             continue
@@ -372,11 +501,42 @@ def normalise(sheet: str, headers: list[str], rows: list[list[str]], rtype: str,
                                                 f"{d_raw} read as {d.isoformat()} (day-first)", "warning"))
                 except ValueError as exc:
                     errs.append(Issue(sheet, n, "date", "invalid_date", f"date: {exc}"))
-        if rtype == "sales":
-            rec["order_id"] = get("order_id")[:64]
+        if rtype == "sales" and (_negative(get("quantity")) or _negative(get("revenue"))):
+            # credit-note / return line inside a sales export: it is a refund, not a bad row
+            rec["type"] = "returns"
+            rec["flags"].append("return_from_sales_file")
+            rec["order_id"] = _id(get("order_id"))[:64] or "(no order id)"
+            rec["product"] = (get("product") or get("description"))[:120] or None
+            text = f"{rec['product'] or ''} {get('description')}"
+            q = abs(float(get("quantity").replace(",", "") or 1))
+            rec["quantity"] = q
+            rev = _num(get("revenue").lstrip("-−"), exp, "revenue", errs, sheet, n) if get("revenue") else None
+            price = _num(get("unit_price").lstrip("-−"), exp, "unit_price", errs, sheet, n)
+            rec["refund_minor"] = rev if rev is not None else round((price or 0) * q)
+            rec["reason"] = None
+            key = ("return", rec["order_id"], rec["product"], rec.get("date"), rec["refund_minor"])
+            fee_cat = _fee_line(text)
+            if "adjustment" in (_special_line(rec["product"]), _special_line(get("description"))) and not errs:
+                adjustments.append((n, -rec["refund_minor"]))
+                continue
+            if fee_cat:  # a marketplace commission / bank charge billed on a credit note is a cost, not a refund
+                rec.update(type="expenses", category=fee_cat, amount_minor=rec.pop("refund_minor"),
+                           description=rec["product"], supplier=None, invoice_id=rec["order_id"], paid=None)
+                rec["order_id"] = None
+                rec["flags"] = ["fee_from_sales_file"]
+                key = ("fee", rec["invoice_id"], rec["description"], rec.get("date"), rec["amount_minor"])
+                if not errs:
+                    res.issues.append(Issue(sheet, n, "product", "read_as_fee",
+                                            f"'{rec['description']}' read as a {fee_cat.replace('_', ' ')} cost",
+                                            "warning"))
+            elif not errs:
+                res.issues.append(Issue(sheet, n, "quantity", "read_as_return",
+                                        "negative line read as a return/refund", "warning"))
+        elif rtype == "sales":
+            rec["order_id"] = _id(get("order_id"))[:64]
             if not rec["order_id"]:
                 errs.append(Issue(sheet, n, "order_id", "required", "order ID is empty"))
-            rec["product"] = get("product")[:120] or None
+            rec["product"] = (get("product") or get("description"))[:120] or None
             q = _qty(get("quantity"), errs, sheet, n)
             rec["quantity"] = q if q is not None else 1.0
             if q is None and get("quantity") == "":
@@ -393,20 +553,32 @@ def normalise(sheet: str, headers: list[str], rows: list[list[str]], rtype: str,
             rec["gross_minor"] = rev
             disc = _num(get("discount"), exp, "discount", errs, sheet, n, allow_neg=True)
             rec["discount_minor"] = abs(disc) if disc is not None else 0
-            if rev is not None and rec["discount_minor"] > rev:
-                errs.append(Issue(sheet, n, "discount", "discount_exceeds_revenue", "discount larger than the line"))
+            # a discount bigger than its line is normal for an order-level discount typed on one line; it is
+            # checked against the whole order after all rows are read
+            rec["customer"] = _id(get("customer"))[:120] or None
             rec["channel"] = get("channel")[:60] or None
             rec["shipping_charged_minor"] = _num(get("shipping_charged"), exp, "shipping_charged", errs, sheet, n) or 0
             st = get("status").lower()
             rec["status"] = ("cancelled" if st in _STATUS_CANCELLED else "returned" if st in _STATUS_RETURNED
                              else "completed")
             key = (rec["order_id"], rec.get("product"), rec.get("date"), rec["gross_minor"])
+            kind = _special_line(rec.get("product")) or _special_line(get("description"))
+            if kind == "adjustment" and not errs and rec["gross_minor"] is not None:
+                adjustments.append((n, rec["gross_minor"]))
+                continue
+            if kind and not errs and rec["gross_minor"] is not None:
+                extra[kind].setdefault(rec["order_id"], []).append((n, rec["gross_minor"]))
+                res.issues.append(Issue(sheet, n, "product", f"{kind}_line",
+                                        f"'{rec['product']}' is a {kind} line, not a product: moved to the order's "
+                                        f"{'delivery fee' if kind == 'delivery' else 'discount'}", "warning"))
+                continue
         elif rtype == "product_costs":
             rec["product"] = get("product")[:120]
             rec["unit_cost_minor"] = _num(get("unit_cost"), exp, "unit_cost", errs, sheet, n)
             if rec["unit_cost_minor"] is None and not any(e.field == "unit_cost" for e in errs):
                 errs.append(Issue(sheet, n, "unit_cost", "required", "unit cost is empty"))
-            key = (rec["product"].lower(),)
+            # SKUs are case-sensitive in many systems (15056BL vs 15056bl are different products)
+            key = (rec["product"],)
         elif rtype == "expenses":
             rec["amount_minor"] = _num(get("amount"), exp, "amount", errs, sheet, n)
             if rec["amount_minor"] is None and not any(e.field == "amount" for e in errs):
@@ -419,7 +591,7 @@ def normalise(sheet: str, headers: list[str], rows: list[list[str]], rtype: str,
                 rec["flags"].append("category_inferred")
             rec["quantity"] = _qty(get("quantity"), errs, sheet, n)
             rec["invoice_id"] = get("invoice_id")[:64] or None
-            rec["order_id"] = get("order_id")[:64] or None  # links a cost to one order (courier/gateway statements)
+            rec["order_id"] = _id(get("order_id"))[:64] or None  # links a cost to one order (courier/gateway statements)
             paid = parse_bool(get("paid")) if get("paid") else None
             if get("paid") and paid is None:
                 low = get("paid").lower()
@@ -435,7 +607,7 @@ def normalise(sheet: str, headers: list[str], rows: list[list[str]], rtype: str,
             key = (rec.get("invoice_id") or "", rec.get("supplier") or "", rec.get("date"), rec["amount_minor"],
                    rec.get("description") or "", rec.get("order_id") or "", rec.get("category"))
         else:  # returns
-            rec["order_id"] = get("order_id")[:64]
+            rec["order_id"] = _id(get("order_id"))[:64]
             if not rec["order_id"]:
                 errs.append(Issue(sheet, n, "order_id", "required", "order ID is empty"))
             rec["product"] = get("product")[:120] or None
@@ -451,6 +623,14 @@ def normalise(sheet: str, headers: list[str], rows: list[list[str]], rtype: str,
             continue
         seen[key] = n
         res.records.append(rec)
+    if rtype == "sales":
+        _attach_order_lines(res, extra, sheet)
+        if adjustments:
+            net = sum(a for _, a in adjustments)
+            res.issues.append(Issue(sheet, adjustments[0][0], "product", "adjustment_lines",
+                                    f"{len(adjustments)} manual adjustment lines (net {net / 100:+,.2f}) were left out "
+                                    "because they are not product sales or returns: check them if they were real "
+                                    "sales", "warning"))
     if rtype == "expenses":
         inferred = sum("category_inferred" in r["flags"] for r in res.records)
         if inferred:

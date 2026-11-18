@@ -27,13 +27,16 @@ class EmailOutcomeUnknown(RuntimeError):
     Never retried automatically; a person has to resolve it."""
 
 
-def send_email(s: LedgerSettings, *, to: str, subject: str, body: str, message_id: str) -> dict:
+def send_email(s: LedgerSettings, *, to: str, subject: str, body: str, message_id: str,
+               reply_to: str | None = None) -> dict:
     if not s.email_configured:
         raise EmailNotConfigured("email sending is not configured (EMAIL_SENDING_ENABLED, SMTP_HOST, SMTP_FROM)")
     msg = EmailMessage()
     msg["From"] = s.smtp_from
     msg["To"] = to
-    msg["Subject"] = subject
+    msg["Subject"] = " ".join(subject.split())  # header values are single-line
+    if reply_to:
+        msg["Reply-To"] = reply_to
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = message_id  # deterministic per approved follow-up: lets providers de-duplicate retries
     msg.set_content(body, charset="utf-8")

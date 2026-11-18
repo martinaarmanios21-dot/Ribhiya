@@ -35,6 +35,7 @@ from . import diagnosis, quotes as quotes_mod, store
 QUOTABLE = {"packaging": "packaging", "shipping": "shipping", "product_costs": "product"}
 TERMS = ("unit_price", "price_tiers", "moq", "setup_fee", "delivery_fee", "lead_time", "payment_terms", "samples")
 PLACEHOLDER = re.compile(r"\[\[[^\]]+\]\]")
+DAILY_SEND_CAP_DEFAULT = 20  # emails per business per day: stops the platform being used as a spam relay
 _EMAIL = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 _COMMITMENT = re.compile(r"\b(we will order|we will buy|confirmed order|purchase order|we commit|we agree to buy)\b|"
                          r"هنطلب أكيد|هنشتري أكيد|أمر شراء|طلب مؤكد|بنأكد الطلب", re.I)
@@ -205,6 +206,11 @@ def update(conn, iid: str, oid: int, *, tenant: str, actor: str, brief: dict | N
         for k in ("sourcing", "specification", "quality_requirements", "business_name", "contact_name", "quantity_unit"):
             if k in brief:
                 b[k] = str(brief[k] or "")[:500]
+        if "reply_to" in brief:  # the business's own address: supplier replies go to the owner, not the platform
+            rt = str(brief["reply_to"] or "").strip()
+            if rt and not _EMAIL.match(rt):
+                raise OutreachError("invalid_email", "reply-to email address is not valid")
+            b["reply_to"] = rt or None
         if "quantity" in brief:
             q = brief["quantity"]
             try:
@@ -222,7 +228,7 @@ def update(conn, iid: str, oid: int, *, tenant: str, actor: str, brief: dict | N
     lang = language if language in ("ar", "en") else o["language"]
     if regenerate or brief or lang != o["language"]:
         subject, body = render(b, o["purpose"], lang, name)
-    subject = (subject if subject is not None else o["subject"])[:200]
+    subject = " ".join((subject if subject is not None else o["subject"]).split())[:200]  # one line, no CR/LF
     body = (body if body is not None else o["body"])[:4000]
     with db.tx(conn):
         conn.execute("UPDATE outreach SET brief=?, supplier_name=?, supplier_email=?, subject=?, body=?, language=?, "
@@ -232,6 +238,14 @@ def update(conn, iid: str, oid: int, *, tenant: str, actor: str, brief: dict | N
         audit(conn, actor, "outreach_edited", tenant=tenant, investigation=iid, outreach=oid,
               approval_voided=o["status"] == "approved")
     return get(conn, iid, oid)
+
+
+def _daily_cap() -> int:
+    import os
+    try:
+        return max(0, int(os.environ.get("OUTREACH_DAILY_CAP", DAILY_SEND_CAP_DEFAULT)))
+    except ValueError:
+        return DAILY_SEND_CAP_DEFAULT
 
 
 def _hash(o: dict) -> str:
@@ -283,6 +297,13 @@ def send(conn, iid: str, oid: int, *, tenant: str, actor: str, approval: str) ->
         raise OutreachError("approval_mismatch", "the message changed after approval")
     p = problems(conn, o, for_send=True)
     s = ledger_settings()
+    cap = _daily_cap()
+    sent_today = conn.execute(
+        "SELECT COUNT(*) FROM outreach o JOIN investigations i ON i.id = o.investigation_id WHERE i.tenant_id=? AND "
+        "o.status IN ('sending','sent','send_unknown') AND o.updated_at >= ?", (tenant, time.time() - 86400)).fetchone()[0]
+    if sent_today >= cap:
+        p.append({"code": "daily_send_cap", "reason": f"the daily limit of {cap} emails is reached: copy the draft and "
+                                                       "send it yourself, or try again tomorrow (it has NOT been sent)"})
     if not s.email_configured:
         p.append({"code": "email_not_configured", "reason": "email sending is not set up: copy the draft and send it "
                                                             "yourself (it has NOT been sent)"})
@@ -298,7 +319,8 @@ def send(conn, iid: str, oid: int, *, tenant: str, actor: str, approval: str) ->
     domain = (s.smtp_from.split("@")[-1] or "tahseela.local").strip(">")
     try:
         result = mailer.send_email(s, to=o["supplier_email"], subject=o["subject"], body=o["body"],
-                                   message_id=f"<tahseela-rfq-{oid}-{approval[:12]}@{domain}>")
+                                   message_id=f"<tahseela-rfq-{oid}-{approval[:12]}@{domain}>",
+                                   reply_to=(o["brief"] or {}).get("reply_to"))
     except mailer.EmailOutcomeUnknown as exc:
         _finish(conn, oid, "send_unknown", {"error": str(exc), "outcome": "unknown"})
         audit(conn, actor, "outreach_send", "unknown", tenant=tenant, investigation=iid, outreach=oid)

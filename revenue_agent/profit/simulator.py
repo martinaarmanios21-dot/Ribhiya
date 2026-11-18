@@ -14,6 +14,8 @@ Supported levers (each is checked against the data before running):
   return_rate_pct         5      (refunds as percent of net sales)
   free_shipping           {"threshold": "800", "fee": "50"}  needs shipping charged to customers in the data
   volume_change_pct       -10    (orders scale; per-order amounts kept)
+  dollar_rate             {"base": "48.5", "new": "55", "linked": {"all": 100}}
+                          product unit costs move with the dollar by each product's linked share (needs unit costs)
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from ..ledger.csv_import import CURRENCY_EXPONENT
 from . import metrics, orders as orders_mod
 
 LEVERS = ("price_change_pct", "product_unit_cost", "packaging_per_order", "shipping_per_order", "discount_pct",
-          "return_rate_pct", "free_shipping", "volume_change_pct")
+          "return_rate_pct", "free_shipping", "volume_change_pct", "dollar_rate")
 
 
 class ScenarioError(ValueError):
@@ -71,7 +73,77 @@ def capabilities(o: dict, period: str) -> dict:
                           "reason": None if any(x["shipping_income"] > 0 for x in rows) else
                           "the sales file has no 'shipping charged' column, so customer delivery fees are unknown"},
         "volume_change_pct": {"ok": bool(rows)},
+        "dollar_rate": {"ok": bool(products_with_cost), "reason": None if products_with_cost else
+                        "no product costs uploaded"},
     }
+
+
+def _with_ar(caps: dict) -> dict:
+    for v in caps.values():
+        if v.get("reason"):
+            v["reason_ar"] = REASON_AR.get(v["reason"], v["reason"])
+    return caps
+
+
+REASON_AR = {
+    "no product costs uploaded": "مفيش تكلفة منتجات مرفوعة",
+    "no packaging costs in this month": "مفيش فواتير تغليف في الشهر ده",
+    "no shipping costs in this month": "مفيش فواتير شحن في الشهر ده",
+    "the sales file has no 'shipping charged' column, so customer delivery fees are unknown":
+        "ملف المبيعات مفيهوش رسوم التوصيل اللي العميل دفعها، فمش معروفة",
+}
+UNTOUCHED_AR = {"sales": "المبيعات", "discounts": "الخصومات", "product cost": "تكلفة المنتج", "packaging": "التغليف",
+                "shipping": "الشحن", "payment fees": "رسوم الدفع", "marketplace fees": "عمولات المنصات",
+                "refunds": "المرتجعات", "delivery fees customers pay": "رسوم التوصيل اللي العميل بيدفعها",
+                "order volume": "عدد الطلبات", "fixed costs and marketing": "المصاريف الثابتة والإعلانات"}
+
+
+def _assumption_ar(a: str) -> str:
+    """Egyptian-Arabic version of an assumption line (falls back to the English text)."""
+    import re
+    fixed = {
+        "customers keep buying the same quantities at the new price (demand not measured)":
+            "العملاء هيفضلوا يشتروا نفس الكميات بالسعر الجديد (رد فعلهم ماتقاسش)",
+        "returned items are refunded at full value and not resold": "المرتجع بيترد بكامل قيمته ومش بيتباع تاني",
+        "the dollar-linked share of each product's cost moves fully with the rate you entered":
+            "الجزء المربوط بالدولار من تكلفة كل منتج بيتحرك بالكامل مع سعر الدولار اللي كتبته",
+        "payment fees stay the same percentage of order value": "رسوم الدفع بتفضل نفس النسبة من قيمة الطلب",
+        "some baseline costs are allocated from monthly invoices (see order profit)":
+            "جزء من تكاليف الشهر متوزّع من فواتير شهرية (شوف ربح الطلبات)",
+    }
+    if a in fixed:
+        return fixed[a]
+    if a.startswith("the same orders happen at the same values"):
+        return "نفس الطلبات بنفس القيم (العملاء مش هيزوّدوا عشان يوصلوا للحد، ومحدش هيلغي بسبب الرسوم)"
+    if a.startswith("unchanged from the baseline month: "):
+        items = a.split(": ", 1)[1].split(", ")
+        return "زي ما هو في الشهر الفعلي: " + "، ".join(UNTOUCHED_AR.get(i, i) for i in items)
+    m = re.match(r"order volume changes by ([+-]?[\d.]+)%", a)
+    if m:
+        return f"عدد الطلبات بيتغيّر {m[1]}% بنفس نوعية الطلبات وقيمها (افتراضك إنت)"
+    m = re.match(r"(\d+) refunds in (\S+) don't name one of your orders", a)
+    if m:
+        return (f"{m[1]} مرتجع في {m[2]} مش مربوطين برقم طلب؛ اتوزّعوا على طلبات الشهر حسب قيمتها عشان الأرقام "
+                "تطابق حسابات الشهر")
+    return a
+
+
+def _spread_unlinked_refunds(rows: list[dict], unmatched: list[dict], period: str) -> dict | None:
+    """Refunds whose order ID matches no order (credit notes with their own number, return IDs) still happened in
+    this month. Leaving them out would make the baseline profit too high and turn a "fewer returns" scenario into a
+    loss, so they are shared across the month's orders by net value (largest-remainder, so the total is exact)."""
+    items = [u for u in unmatched if (u.get("date") or "")[:7] == period]
+    total = sum(u["amount"] for u in items)
+    weights = [max(x["gross"] - x["discount"], 0) for x in rows]
+    if not total or not sum(weights):
+        return None
+    shares = [total * w / sum(weights) for w in weights]
+    alloc = [int(v) for v in shares]
+    for i in sorted(range(len(rows)), key=lambda i: shares[i] - alloc[i], reverse=True)[:total - sum(alloc)]:
+        alloc[i] += 1
+    for x, a in zip(rows, alloc):
+        x["refunds"] += a
+    return {"count": len(items), "amount": total}
 
 
 def _totals(rows: list[dict], fixed: int, cur: str) -> dict:
@@ -116,12 +188,13 @@ def run(records: list[dict], currency: str, scenario: dict, *, period: str | Non
     period = period or periods[-1]
     if period not in periods:
         raise ScenarioError(f"no orders in {period}")
-    caps = capabilities(o, period)
+    caps = _with_ar(capabilities(o, period))
     for lever in scenario:
         if not caps[lever]["ok"]:
             raise ScenarioError(f"{lever} can't be tested with this data: {caps[lever].get('reason')}")
-    base_rows = [x for x in o["orders"] if x["period"] == period and x["complete"]]
+    base_rows = copy.deepcopy([x for x in o["orders"] if x["period"] == period and x["complete"]])
     excluded = sum(1 for x in o["orders"] if x["period"] == period and not x["complete"])
+    unlinked = _spread_unlinked_refunds(base_rows, o["unmatched_refunds"], period)
     m = next((p for p in metrics.compute(records)["periods"] if p["period"] == period and p["currency"] == currency), None)
     fixed = (m["fixed_total"] + m["marketing"]) if m else 0
     proj = copy.deepcopy(base_rows)  # stored records are never modified
@@ -146,6 +219,7 @@ def run(records: list[dict], currency: str, scenario: dict, *, period: str | Non
         touched.update({"sales", "payment fees"})
         if "volume_change_pct" not in scenario:
             assumptions.append("customers keep buying the same quantities at the new price (demand not measured)")
+    newc: dict = {}
     if "product_unit_cost" in scenario:
         spec = scenario["product_unit_cost"]
         if not isinstance(spec, dict) or not spec:
@@ -159,6 +233,27 @@ def run(records: list[dict], currency: str, scenario: dict, *, period: str | Non
                                   * l["quantity"]) for l in x["lines"])
         changed.append("product_cost")
         touched.add("product cost")
+    if "dollar_rate" in scenario:
+        from . import fx
+        spec = scenario["dollar_rate"]
+        if not isinstance(spec, dict):
+            raise ScenarioError('dollar_rate must be like {"base": "48.5", "new": "55", "linked": {"all": 100}}')
+        try:
+            fs = fx.validate({"base_rate": spec.get("base"), "current_rate": spec.get("new"),
+                              "linked": spec.get("linked") or {"all": 100}})
+        except fx.FxError as exc:
+            raise ScenarioError(f"dollar_rate: {exc}") from exc
+        if fs is None:
+            raise ScenarioError("dollar_rate needs both the old and the new rate")
+        ratio = fs["current_rate"] / fs["base_rate"]
+        entered = newc if "product_cost" in changed else {}  # a new supplier cost entered too moves with the dollar
+        for x in proj:
+            x["cogs"] = sum(round(entered.get(l["product"], (l["cogs"] or 0) / l["quantity"] if l["quantity"] else 0)
+                                  * (1 + fx._share(fs["linked"], l["product"]) * (ratio - 1)) * l["quantity"])
+                            for l in x["lines"])
+        changed.append("dollar")
+        touched.add("product cost")
+        assumptions.append("the dollar-linked share of each product's cost moves fully with the rate you entered")
     for lever, cat in (("packaging_per_order", "packaging"), ("shipping_per_order", "shipping")):
         if lever in scenario:
             v = _minor(scenario[lever], currency, lever)
@@ -212,12 +307,17 @@ def run(records: list[dict], currency: str, scenario: dict, *, period: str | Non
     assumptions.append("unchanged from the baseline month: " + ", ".join(untouched))
     if o["orders_with_allocated_costs"]:
         assumptions.append("some baseline costs are allocated from monthly invoices (see order profit)")
+    if unlinked:
+        assumptions.append(f"{unlinked['count']} refunds in {period} don't name one of your orders; they are shared "
+                           "across the month's orders by order value so the baseline matches your monthly figures")
     base = _totals(base_rows, fixed, currency)
     new = _totals(proj, fixed, currency)
     delta = {k: round(new[k] - base[k], 4 if k == "contribution_margin" else 2)
              if isinstance(base[k], (int, float)) and isinstance(new[k], (int, float)) else None for k in base}
     return {"type": "projection", "changed": sorted(touched), "period": period, "currency": currency, "scenario": scenario, "baseline": base,
-            "projected": new, "delta": delta, "assumptions": assumptions, "excluded_incomplete_orders": excluded,
+            "projected": new, "delta": delta,
+            "assumptions": [_assumption_ar(a) for a in assumptions] if lang == "ar" else assumptions,
+            "excluded_incomplete_orders": excluded,
             "capabilities": caps, "summary": _summary(base, new, delta, currency, period, lang, assumptions, excluded)}
 
 

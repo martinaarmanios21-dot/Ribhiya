@@ -9,6 +9,8 @@ import { Card, Confirm, ErrorNote, Loading, Pill, Spinner, useErrorToast } from 
 import { BridgeChart, CostPerOrderChart, ProductsChart, TrendChart, major, useIT } from "@/components/charts";
 import { OrderProfit, Quotes, Simulator } from "@/components/profit-tools";
 import { EvidenceList, Outreach } from "@/components/evidence-outreach";
+import { Growth, Privacy } from "@/components/growth";
+import { Dollar } from "@/components/dollar";
 import { PENDING_GO } from "@/components/GuideChat";
 import { useApp } from "@/lib/app-context";
 import { gapi, oapi, papi, papi2, type Question } from "@/lib/tapi";
@@ -28,8 +30,8 @@ const FIELDS: Record<string, string[]> = {
   returns: ["order_id", "date", "product", "quantity", "refund_amount", "reason", "currency"],
 };
 
-type Tab = "files" | "products" | "whatif" | "suppliers" | "results";
-const TABS: Tab[] = ["files", "products", "whatif", "suppliers", "results"];
+type Tab = "files" | "products" | "whatif" | "dollar" | "grow" | "suppliers" | "results";
+const TABS: Tab[] = ["files", "products", "whatif", "dollar", "grow", "suppliers", "results"];
 
 /** The five steps an owner goes through. Each is "done" from real data, never from clicks alone. */
 /** "Show me" from the guide: a tab or a card on this page (also replays a request made from another page). */
@@ -98,10 +100,12 @@ function Investigation() {
             </button>
           ))}
         </nav>
-        <div className="grid gap-4 p-4">
-          {active === "files" && <><Files s={s} id={id} /><Memory /><Danger id={id} /></>}
+        <div className="grid grid-cols-[minmax(0,1fr)] gap-4 p-4">
+          {active === "files" && <><Files s={s} id={id} /><Memory /><Privacy /><Danger id={id} /></>}
           {active === "products" && (s.orders ? <><OrderProfit ov={s.orders} id={id} /><MoreCharts s={s} /></> : <Empty text={it("emptyNeedSales")} />)}
           {active === "whatif" && (s.orders?.simulator?.period ? <Simulator ov={s.orders} id={id} scenarios={s.scenarios} /> : <Empty text={it("emptyNeedSales")} />)}
+          {active === "dollar" && (s.record_counts?.sales ? <Dollar id={id} /> : <Empty text={it("emptyNeedSales")} />)}
+          {active === "grow" && (s.record_counts?.sales ? <Growth id={id} /> : <Empty text={it("emptyNeedSales")} />)}
           {active === "suppliers" && (s.orders ? <><Outreach s={s} id={id} openId={openOutreachId} /><div id="quotes"><Quotes id={id} currency={s.orders.currency} outreach={s.outreach} products={s.orders.products.map((p: any) => p.product)} /></div></> : <Empty text={it("emptyNeedSales")} />)}
           {active === "results" && (s.interventions.length ? <div id="tracking"><Tracking s={s} id={id} /></div> : <Empty text={it("emptyResults")} />)}
         </div>
@@ -332,7 +336,8 @@ function FindingDetails({ f, id }: { f: any; id: string }) {
         <div className="mb-1 font-semibold">{it("q_options")}</div>
         <ul className="grid gap-1.5">{f.recommendation.options.map((o: any) => (
           <li key={o.key} className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-card px-3 py-2">
-            <span>{o.title}</span>
+            <span className="grid gap-0.5"><span>{o.title}</span>
+              {o.measured && <span className="text-xs text-muted-foreground">{o.tradeoffs}</span>}</span>
             <button className="text-xs font-semibold text-primary underline" onClick={() => plan(o.key)}>{it("chooseThis")}</button>
           </li>))}</ul>
       </div>
@@ -363,6 +368,7 @@ function MoreCharts({ s }: { s: any }) {
 /* --------------------------------------------------------------------------- uploads */
 function UploadBox({ id, category, upload }: { id: string; category?: string | null; upload?: string | null }) {
   const it = useIT();
+  const { lang } = useApp();
   const qc = useQueryClient();
   const onErr = useErrorToast();
   const [busy, setBusy] = useState(false);
@@ -373,7 +379,7 @@ function UploadBox({ id, category, upload }: { id: string; category?: string | n
     setBusy(true);
     try {
       const r = await papi.upload(id, files);
-      r.results.forEach((x, i) => x.status === "imported" ? toast.success(`${files[i]?.name}: ${it("imported")}`) : toast.error(`${files[i]?.name}: ${x.summary.fatal ?? it("failed")}`));
+      r.results.forEach((x, i) => x.status === "imported" ? toast.success(`${files[i]?.name}: ${it("imported")}`) : toast.error(`${files[i]?.name}: ${(lang === "ar" && x.summary.fatal_ar) || x.summary.fatal || it("failed")}`));
       await qc.invalidateQueries({ queryKey: ["inv", id] });
     } catch (e) { onErr(e); } finally { setBusy(false); }
   };
@@ -434,6 +440,7 @@ function Files({ s, id }: { s: any; id: string }) {
 
 function FileRow({ f, id, onRemove }: { f: any; id: string; onRemove: () => void }) {
   const it = useIT();
+  const { lang } = useApp();
   const [open, setOpen] = useState(false);
   const ok = f.status === "imported";
   return (
@@ -445,7 +452,7 @@ function FileRow({ f, id, onRemove }: { f: any; id: string; onRemove: () => void
         <button className="ms-auto text-xs underline" onClick={() => setOpen(!open)}>{it("issues")} <ChevronDown className="inline size-3" /></button>
         <button onClick={onRemove} aria-label={it("remove")} className="rounded p-1 text-danger hover:bg-danger/10"><Trash2 className="size-4" /></button>
       </div>
-      {f.summary.fatal && <p className="mt-1 text-danger" dir="auto">{f.summary.fatal}</p>}
+      {f.summary.fatal && <p className="mt-1 text-danger" dir="auto">{(lang === "ar" && f.summary.fatal_ar) || f.summary.fatal}</p>}
       {f.summary.tables.map((t: any) => (
         <div key={t.sheet} className="mt-2 rounded-lg bg-muted/50 p-2">
           <div className="flex flex-wrap gap-2 text-xs">
@@ -456,11 +463,11 @@ function FileRow({ f, id, onRemove }: { f: any; id: string; onRemove: () => void
             {t.mapping_reused_from_memory && <Pill tone="primary">{it("mappingReused")}</Pill>}
             {!!t.periods.length && <span dir="ltr">{t.periods[0]} → {t.periods.at(-1)}</span>}
           </div>
-          {t.needs_confirmation.map((n: string) => <p key={n} className="mt-1 text-xs text-warning" dir="auto">{n}</p>)}
+          {((lang === "ar" && t.needs_confirmation_ar) || t.needs_confirmation).map((n: string) => <p key={n} className="mt-1 text-xs text-warning" dir="auto">{n}</p>)}
           {(t.detected_type === null || t.needs_confirmation.length > 0 || t.missing_required.length > 0) && <MappingFix t={t} id={id} fileId={f.id} />}
           {open && t.issues.length > 0 && (
             <ul className="mt-2 max-h-40 overflow-auto text-xs" dir="ltr">
-              {t.issues.map((x: any, i: number) => <li key={i} className={x.severity === "error" ? "text-danger" : "text-warning"}>row {x.row} · {x.field} · {x.message}</li>)}
+              {t.issues.map((x: any, i: number) => <li key={i} className={x.severity === "error" ? "text-danger" : "text-warning"}>{lang === "ar" ? <>سطر {x.row} · {x.message_ar || x.message}</> : <>row {x.row} · {x.field} · {x.message}</>}</li>)}
             </ul>
           )}
         </div>
@@ -474,6 +481,7 @@ function MappingFix({ t, id, fileId }: { t: any; id: string; fileId: number }) {
   const qc = useQueryClient();
   const onErr = useErrorToast();
   const [open, setOpen] = useState(false);
+  const { lang } = useApp();
   const [type, setType] = useState<string>(t.detected_type ?? "sales");
   const [map, setMap] = useState<Record<string, string>>(t.mapping ?? {});
   const fileRef = useRef<HTMLInputElement>(null);
@@ -481,7 +489,7 @@ function MappingFix({ t, id, fileId }: { t: any; id: string; fileId: number }) {
     if (!file) return;
     try {
       const r = await papi.upload(id, [file], { overrides: { [t.sheet]: { type, mapping: Object.fromEntries(Object.entries(map).filter(([, v]) => v)) } }, confirm: true, replace_file_id: fileId });
-      r.results[0]?.status === "imported" ? toast.success(it("imported")) : toast.error(r.results[0]?.summary.fatal ?? it("failed"));
+      r.results[0]?.status === "imported" ? toast.success(it("imported")) : toast.error((lang === "ar" && r.results[0]?.summary.fatal_ar) || r.results[0]?.summary.fatal || it("failed"));
       await qc.invalidateQueries({ queryKey: ["inv", id] });
     } catch (e) { onErr(e); }
   };
@@ -523,7 +531,7 @@ function Tracking({ s, id }: { s: any; id: string }) {
           const tone = x.status === "verified_improvement" ? "ok" : ["no_measurable_improvement", "inconclusive"].includes(x.status) ? "warn" : "primary";
           return (
             <li key={x.id} className="rounded-xl border p-3 text-sm">
-              <div className="flex flex-wrap items-center gap-2"><b>{x.title}</b><Pill tone={tone as any}>{it(`st_${x.status}`)}</Pill><span className="font-mono text-xs">{x.option_key}</span></div>
+              <div className="flex flex-wrap items-center gap-2"><b>{x.title}</b><Pill tone={tone as any}>{it(`st_${x.status}`)}</Pill>{x.option_key !== "scenario" && <span className="font-mono text-xs">{x.option_key}</span>}</div>
               <div className="mt-1 text-xs text-muted-foreground">{it("baseline")}: <span dir="ltr">{x.baseline.period}</span> · {money(Math.round(x.baseline.per_order), x.currency)} {it("perOrder")} · {x.baseline.orders}</div>
               <div className="mt-1 text-xs"><b>{it("projection")}:</b> {x.projection.text}</div>
               {x.status === "planned" && (

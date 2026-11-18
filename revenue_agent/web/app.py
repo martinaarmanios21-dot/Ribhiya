@@ -26,6 +26,7 @@ from ..simulator import BUSINESSES
 from . import auth
 from .profit_api import router as profit_router
 from .guide_api import router as guide_router
+from .upload_link import router as upload_link_router
 
 STATIC = Path(__file__).parent / "static"
 FRONTEND_DIST = Path(__file__).parent / "app"   # the Ribhiya web app (built from frontend/, committed)
@@ -33,19 +34,78 @@ app = FastAPI(title="Ribhiya API", version="0.3.0",
               description="Back end for Ribhiya, an AI profitability and cost-leakage specialist that works on the "
                           "owner's own business files. The /api/train, /api/learn, /api/workspace and /judges endpoints "
                           "are the separate simulation lab (synthetic data only).")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",")],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# The web app is served from this same origin, so no cross-origin access is needed by default. Set CORS_ORIGINS
+# only for a separately hosted front end (never "*" with real data).
+_CORS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+if _CORS:
+    app.add_middleware(CORSMiddleware, allow_origins=_CORS, allow_methods=["GET", "POST", "PUT", "DELETE"],
+                       allow_headers=["content-type", "x-tahsila-token", "x-tahsila-session", "x-tahsila-user"])
 
+
+
+MAX_REQUEST_BYTES = 25_000_000  # uploads are capped at 10 MB per file; refuse oversized bodies before reading them
+
+
+def _csp() -> str:
+    """Strict Content-Security-Policy for the web app. Its inline scripts (router hydration data) are allowed by
+    their exact SHA-256 hash, so no other inline script can run (no 'unsafe-inline')."""
+    import base64
+    import hashlib
+    import re as _re
+    hashes = []
+    index = FRONTEND_DIST / "index.html"
+    if index.is_file():
+        for body in _re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", index.read_text(encoding="utf-8"), _re.S):
+            # hash the text the browser executes: the HTML parser turns NUL into U+FFFD and CR/CRLF into LF (the
+            # router's hydration script really contains a NUL, so hashing the raw file text would block it)
+            body = body.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "\ufffd")
+            hashes.append("'sha256-" + base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode() + "'")
+    return ("default-src 'self'; script-src 'self' 'report-sample' " + " ".join(hashes) + "; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; "
+            "frame-ancestors 'none'")
+
+
+CSP = _csp()
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > MAX_REQUEST_BYTES:
+        return JSONResponse({"detail": {"code": "too_large", "message": "request too large (max 25 MB)"}},
+                            status_code=413)
+    response = await call_next(request)
+    h = response.headers
+    h.setdefault("X-Content-Type-Options", "nosniff")
+    h.setdefault("X-Frame-Options", "DENY")
+    h.setdefault("Referrer-Policy", "same-origin")
+    h.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
+        h.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    if not request.url.path.startswith(("/api/", "/judges", "/static")):
+        h.setdefault("Content-Security-Policy", CSP)
+    return response
 
 
 @app.middleware("http")
 async def authenticate(request: Request, call_next):
     """Authentication + tenant resolution for every /api request (see web/auth.py). Fails closed."""
     if request.url.path.startswith("/api/"):
+        err = auth.config_error()
+        if err:  # fail closed: a broken token setting must not open the API
+            return JSONResponse({"detail": {"code": "auth_misconfigured", "message": err}}, status_code=503)
+        host = (request.headers.get("host") or "").rsplit(":", 1)[0].lower()
+        origin = request.headers.get("origin")
+        if origin and origin.rstrip("/") not in _CORS and \
+                origin.split("://", 1)[-1].rstrip("/").lower() != (request.headers.get("host") or "").lower():
+            # another website's page calling this API from the owner's browser (CSRF)
+            return JSONResponse({"detail": {"code": "forbidden_origin", "message": "cross-site request refused"}},
+                                status_code=403)
+        if not auth.auth_configured() and host not in auth.LOCAL_HOSTS:
+            # open local mode answers only to localhost (stops DNS rebinding and accidental exposure)
+            return JSONResponse({"detail": {"code": "unauthorized", "message": "set TENANT_TOKENS or ADMIN_TOKEN to "
+                                            "serve beyond localhost"}}, status_code=401)
         principal = auth.resolve(request.headers.get("x-tahsila-token"))
         if principal is None:
             return JSONResponse({"detail": {"code": "unauthorized", "message": "valid X-Tahsila-Token required"}},
@@ -58,6 +118,7 @@ async def authenticate(request: Request, call_next):
 
 
 app.include_router(profit_router)
+app.include_router(upload_link_router)  # /u/<signed token>: owner uploads files without any AI in between
 app.include_router(guide_router)
 
 _job_lock = threading.Lock()

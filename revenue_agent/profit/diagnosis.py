@@ -16,9 +16,13 @@ from .ingest import VARIABLE
 
 MIN_ORDERS = 30          # per period, for a "supported" finding
 MATERIAL_SHARE = 0.01    # a driver matters when it moves contribution/order by ≥1% of net sales/order
+CONCENTRATED_SHARE = 0.20  # one return this big a share of the month's refunds may be a one-off, not a trend
+VALUE_LINKED = ("discounts", "refunds", "payment_fees", "marketplace_fees")  # grow with order value by nature
 
 DRIVER_LABEL = {
-    "price_and_mix": {"en": "selling price / product mix", "ar": "سعر البيع أو نوعية المنتجات المباعة"},
+    "price_and_mix": {"en": "selling price of the same products", "ar": "سعر بيع نفس المنتجات"},
+    "basket_size": {"en": "what customers buy per order (how many items, and which)",
+                    "ar": "اللي العملاء بيشتروه في الطلب (عدد القطع ونوعها)"},
     "shipping_income": {"en": "delivery fees customers pay", "ar": "رسوم التوصيل اللي العملاء بيدفعوها"},
     "discounts": {"en": "discounts", "ar": "الخصومات"},
     "refunds": {"en": "refunds and returns", "ar": "المرتجعات"},
@@ -29,7 +33,7 @@ DRIVER_LABEL = {
     "marketplace_fees": {"en": "marketplace commissions", "ar": "عمولات المنصات"},
 }
 DRIVER_DATA = {  # which data must exist in BOTH periods for a driver to be measured
-    "price_and_mix": "sales", "discounts": "sales", "shipping_income": "sales", "refunds": "returns", "product_costs": "product_costs",
+    "price_and_mix": "sales", "basket_size": "sales", "discounts": "sales", "shipping_income": "sales", "refunds": "returns", "product_costs": "product_costs",
     "packaging": "packaging", "shipping": "shipping", "payment_fees": "payment_fees",
     "marketplace_fees": "marketplace_fees",
 }
@@ -198,13 +202,13 @@ def diagnose(records: list[dict], m: dict, cur: str, base_p: str | None = None, 
     curr = by.get(cur_p) if cur_p else periods[-1]
     if not base or not curr or base["period"] >= curr["period"]:
         raise ValueError("choose two periods with orders, the first earlier than the second")
-    bridge = metrics.contribution_bridge(base, curr)
+    bridge = metrics.contribution_bridge(base, curr, m["products"])
     data = _data_by_period(records, cur)
     has = lambda tag, per: tag in data.get(per, set())  # noqa: E731
     present_anywhere = {t for s in data.values() for t in s}
     if m["has_product_costs"]:
         present_anywhere.add("product_costs")
-    findings, untested, gaps = [], [], []
+    findings, untested, gaps, explained = [], [], [], []
     threshold = MATERIAL_SHARE * (base["per_order"]["net_sales"] or 0)
     for key, delta in sorted(bridge["components"].items(), key=lambda kv: kv[1]):
         need = DRIVER_DATA[key]
@@ -229,6 +233,14 @@ def diagnose(records: list[dict], m: dict, cur: str, base_p: str | None = None, 
             if need in VARIABLE or need in ("product_costs", "returns"):
                 untested.append(key)
             continue
+        if delta < 0 and abs(delta) >= threshold and key in VALUE_LINKED:
+            share_b = metrics._ratio(base["per_order"][key], base["per_order"]["gross_sales"])
+            share_c = metrics._ratio(curr["per_order"][key], curr["per_order"]["gross_sales"])
+            if share_b is not None and share_c is not None and share_c <= share_b:
+                # more per order only because orders got bigger: same share of sales, so not a leak
+                explained.append({"driver": key, "change_per_order": delta, "share_base": share_b,
+                                  "share_current": share_c})
+                continue
         if delta < 0 and abs(delta) >= threshold:
             low_orders = base["orders"] < MIN_ORDERS or curr["orders"] < MIN_ORDERS
             conf = "supported" if coverage_ok and not low_orders else "preliminary"
@@ -244,13 +256,19 @@ def diagnose(records: list[dict], m: dict, cur: str, base_p: str | None = None, 
     sales_growth = metrics._ratio(curr["net_sales"] - base["net_sales"], base["net_sales"])
     contrib_growth = metrics._ratio(curr["contribution"] - base["contribution"], abs(base["contribution"]) or None)
     return {"comparable": True, "currency": cur, "base": base, "current": curr, "bridge": bridge,
-            "findings": findings, "untested": untested, "gaps": gaps, "sales_growth": sales_growth,
+            "findings": findings, "untested": untested, "gaps": gaps, "explained_by_order_size": explained,
+            "sales_growth": sales_growth,
             "contribution_growth": contrib_growth, "partial_current_period": _partial_period(records, curr["period"]),
             "headline": _headline(base, curr, findings)}
 
 
+PER_ITEM_FIELD = {"price_and_mix": "gross_per_unit", "product_costs": "cogs_per_unit", "basket_size": "units"}
+
+
 def _component_values(key: str, b: dict, c: dict) -> tuple[float, float]:
-    field = {"price_and_mix": "gross_sales", "product_costs": "cogs"}.get(key, key)
+    field = PER_ITEM_FIELD.get(key, key)
+    if b["per_order"].get(field) is None or c["per_order"].get(field) is None:  # no unit counts: old per-order view
+        field = {"price_and_mix": "gross_sales", "product_costs": "cogs"}.get(key, key)
     if field not in b["per_order"]:
         return 0.0, 0.0
     return round(b["per_order"][field], 2), round(c["per_order"][field], 2)
@@ -270,7 +288,17 @@ def _evidence(records: list[dict], key: str, cur: str, bp: str, cp: str) -> dict
             q = [r for r in rows if r["date"][:7] == per and r.get("quantity")]
             if q:
                 unit_prices[per] = round(sum(r["amount_minor"] for r in q) / sum(r["quantity"] for r in q), 2)
-    return {"record_type": rtype, "category": cat, "records": len(rows),
+    top = None
+    if rtype == "returns":  # is the increase one big return rather than a trend?
+        by_order: dict[str, int] = {}
+        for r in rows:
+            if r["date"][:7] == cp:
+                by_order[r["order_id"]] = by_order.get(r["order_id"], 0) + r["refund_minor"]
+        total = sum(by_order.values())
+        if total and len(by_order) >= 2:
+            oid, amt = max(by_order.items(), key=lambda kv: kv[1])
+            top = {"order_id": oid, "amount": amt, "share": round(amt / total, 4), "returns": len(by_order)}
+    return {"record_type": rtype, "category": cat, "records": len(rows), "top_return": top,
             "files": sorted({r.get("file_id") for r in rows if r.get("file_id")}),
             "manual_entries": sum(1 for r in rows if "manual_entry" in r.get("flags", [])),
             "inferred_categories": sum(1 for r in rows if "category_inferred" in r.get("flags", [])),
@@ -298,27 +326,63 @@ def explain(f: dict, d: dict, lang: str) -> dict:
     bv, cv = _fmt(f["base_value_per_order"], cur, lang), _fmt(f["current_value_per_order"], cur, lang)
     impact = _fmt(abs(f["impact_total"]), cur, lang)
     per = _fmt(abs(f["change_per_order"]), cur, lang)
-    up_is_bad = key not in ("price_and_mix", "shipping_income")
+    up_is_bad = key not in ("price_and_mix", "shipping_income", "basket_size")
     ev = f["evidence"]
+    per_item = key in PER_ITEM_FIELD and b["per_order"].get(PER_ITEM_FIELD[key]) is not None
+    if key == "basket_size":  # items, not money
+        bv, cv = f"{f['base_value_per_order']:.2f}", f"{f['current_value_per_order']:.2f}"
     if ar:
-        what = (f"كل طلب بقى بيسيبلك {per} أقل بسبب {lbl}." if up_is_bad else
-                f"كل طلب بقى بيجيب {per} أقل قبل أي تكاليف.")
-        why = ("تخيّل كل طلب كإنه جردل فلوس: العميل بيحط فيه، والمنتج والتغليف والشحن والرسوم بياخدوا منه. لو "
-               "التكاليف دي زادت أسرع من اللازم، ممكن تبيع أكتر وتكسب أقل. "
-               f"على {c['orders']} طلب في {c['period']}، ده معناه حوالي {impact} أقل في الشهر.")
-        evidence = (f"{lbl} لكل طلب كان {bv} في {b['period']} وبقى {cv} في {c['period']} "
+        what = (f"العملاء بقوا بيشتروا قطع أقل أو أصناف ربحها أقل في الطلب الواحد، فبتخسر {per} من مكسب كل طلب."
+                if key == "basket_size"
+                else f"بقيت تبيع نفس المنتجات بسعر أقل، فكل طلب بقى بيجيب {per} أقل قبل أي تكاليف." if key == "price_and_mix"
+                else f"بتخسر {per} من مكسب كل طلب بسبب {lbl}.")
+        why = (("كل قطعة زيادة في الطلب بتجيب ربح من غير ما تدفع شحن أو تغليف تاني. لما الطلب يصغر أو العملاء "
+                "يختاروا الأصناف اللي ربحها قليل، نفس المصاريف بتتوزع على ربح أقل. ") if key == "basket_size" else
+               ("لما تبيع نفس المنتج بسعر أقل (تخفيض أو عرض) والتكلفة زي ما هي، الفرق كله بيطلع من ربحك. ")
+               if key == "price_and_mix" else
+               ("تخيّل كل طلب كإنه جردل فلوس: العميل بيحط فيه، والمنتج والتغليف والشحن والرسوم بياخدوا منه. لو "
+                "التكاليف دي زادت أسرع من اللازم، ممكن تبيع أكتر وتكسب أقل. ")) + \
+            f"على {c['orders']} طلب في {c['period']}، ده معناه حوالي {impact} أقل في الشهر."
+        unit_ar = "لكل قطعة" if per_item and key != "basket_size" else "لكل طلب"
+        evidence = (f"{lbl} {unit_ar} كان {bv} في {b['period']} وبقى {cv} في {c['period']} "
                     f"(من {ev['records']} سجل في الملفات اللي رفعتها).")
+        lfl = (d.get("bridge") or {}).get("like_for_like") or {}
+        if key in ("price_and_mix", "product_costs") and lfl.get("price_pct" if key == "price_and_mix" else "cost_pct") is not None:
+            pct = lfl["price_pct" if key == "price_and_mix" else "cost_pct"]
+            what_moved = "أسعار" if key == "price_and_mix" else "تكلفة"
+            evidence = (f"{what_moved} نفس المنتجات اتغيّرت {pct * 100:+.1f}% في المتوسط بين {b['period']} و{c['period']} "
+                        f"(محسوبة على المنتجات اللي اتباعت في الشهرين بس، من {ev['records']} سجل).")
+        if key == "basket_size":
+            evidence = (f"عدد القطع في الطلب كان {bv} في {b['period']} وبقى {cv} في {c['period']}، والباقي من التغيير "
+                        f"سببه نوع المنتجات اللي العملاء اختاروها (من {ev['records']} سجل في ملفاتك).")
         if ev["unit_price_by_period"]:
             evidence += " سعر الوحدة في الفواتير: " + "، ".join(
                 f"{p}: {_fmt(v, cur, lang)}" for p, v in ev["unit_price_by_period"].items()) + "."
     else:
-        what = (f"Each order now leaves you {per} less because of {lbl}." if up_is_bad else
-                f"Each order now brings in {per} less before any costs.")
-        why = ("Think of every order as a small bucket of money: the customer fills it, and product, packaging, "
-               "delivery and fees take some back out. If those costs grow too fast, you can sell more and still keep "
-               f"less. Across {c['orders']} orders in {c['period']}, that is about {impact} less this month.")
-        evidence = (f"{lbl.capitalize()} per order was {bv} in {b['period']} and {cv} in {c['period']} "
+        what = (f"Customers now buy fewer or lower-margin items per order, so each order leaves you {per} less."
+                if key == "basket_size"
+                else f"You now sell the same products for less, so each order brings in {per} less before any costs."
+                if key == "price_and_mix" else f"Each order now leaves you {per} less because of {lbl}.")
+        why = (("Every extra item in an order earns profit without another delivery or package. When baskets shrink "
+                "or customers pick your lower-margin items, the same order costs are spread over less profit. ")
+               if key == "basket_size" else
+               ("When you sell the same product for less (a discount or promotion) and its cost stays the same, "
+                "the whole difference comes out of your profit. ") if key == "price_and_mix" else
+               ("Think of every order as a small bucket of money: the customer fills it, and product, packaging, "
+                "delivery and fees take some back out. If those costs grow too fast, you can sell more and still keep "
+                "less. ")) + f"Across {c['orders']} orders in {c['period']}, that is about {impact} less this month."
+        unit_en = "per item" if per_item and key != "basket_size" else "per order"
+        evidence = (f"{lbl.capitalize()} {unit_en} was {bv} in {b['period']} and {cv} in {c['period']} "
                     f"(from {ev['records']} records in your uploaded files).")
+        lfl = (d.get("bridge") or {}).get("like_for_like") or {}
+        if key in ("price_and_mix", "product_costs") and lfl.get("price_pct" if key == "price_and_mix" else "cost_pct") is not None:
+            pct = lfl["price_pct" if key == "price_and_mix" else "cost_pct"]
+            what_moved = "prices" if key == "price_and_mix" else "unit costs"
+            evidence = (f"The same products' {what_moved} moved {pct * 100:+.1f}% on average between {b['period']} and "
+                        f"{c['period']} (counting only products sold in both months; {ev['records']} records).")
+        if key == "basket_size":
+            evidence = (f"Items per order went from {bv} in {b['period']} to {cv} in {c['period']}; the rest of the "
+                        f"change is which products customers chose (from {ev['records']} records in your files).")
         if ev["unit_price_by_period"]:
             evidence += " Unit price on the invoices: " + ", ".join(
                 f"{p}: {_fmt(v, cur, lang)}" for p, v in ev["unit_price_by_period"].items()) + "."
@@ -331,6 +395,12 @@ def explain(f: dict, d: dict, lang: str) -> dict:
     if ev["inferred_categories"]:
         caveats.append("بعض الفواتير اتصنّفت من الوصف، راجع التصنيف." if ar else
                        "Some invoices were categorised from their description; please check the categories.")
+    tr = ev.get("top_return")
+    if tr and tr["share"] >= CONCENTRATED_SHARE:
+        caveats.append(f"مرتجع واحد ({tr['order_id']}) هو {tr['share']:.0%} من مرتجعات الشهر: اتأكد إنه مش حالة واحدة "
+                       "قبل ما تغيّر أي حاجة." if ar else
+                       f"One return ({tr['order_id']}) is {tr['share']:.0%} of this month's refunds: check whether it "
+                       "is a one-off before changing anything.")
     if d.get("partial_current_period"):
         caveats.append(f"شهر {c['period']} ممكن يكون مش كامل." if ar else f"{c['period']} may be a partial month.")
     next_step = {
@@ -346,6 +416,8 @@ def explain(f: dict, d: dict, lang: str) -> dict:
                           "Let's compare supplier unit costs between the two months."),
         "price_and_mix": ("نشوف أنهي منتجات بتتباع أكتر دلوقتي وهامشها قد إيه." if ar else
                           "Let's see which products sell more now and what margin they carry."),
+        "basket_size": ("نشوف المنتجات اللي بتتباع مع بعض عشان نعمل منها عروض مجمّعة." if ar else
+                        "Let's see which products sell together so we can bundle them."),
     }.get(key, "نراجع الفواتير دي بالتفصيل." if ar else "Let's review these invoices in detail.")
     return {"what": what, "why": why, "evidence": evidence, "caveats": caveats, "next": next_step}
 
@@ -359,6 +431,7 @@ OPTIONS = {
     "refunds": ["collect_reasons", "size_guide_quality_check", "pre_dispatch_confirmation"],
     "product_costs": ["compare_supplier_quotes", "reprice_low_margin", "review_bill_of_materials"],
     "price_and_mix": ["promote_high_margin", "review_prices"],
+    "basket_size": ["bundle_offers", "free_shipping_threshold", "suggest_add_ons"],
     "payment_fees": ["compare_gateways", "encourage_cheaper_methods"],
     "marketplace_fees": ["compare_channels", "review_fee_tier"],
 }
@@ -409,12 +482,13 @@ OPTION_TEXT = {
     "collect_reasons": ("Record a reason for every return for the next month.",
                         "سجّل سبب كل مرتجع لمدة الشهر الجاي.", "No cost; it tells us what to fix.",
                         "من غير تكلفة؛ وبيقولنا نصلّح إيه."),
-    "size_guide_quality_check": ("Add a size guide or a quality check before dispatch.",
-                                 "ضيف جدول مقاسات أو فحص جودة قبل الشحن.",
+    "size_guide_quality_check": ("Make product pages clearer (real photos, sizes/measurements) and check quality "
+                                 "before dispatch.",
+                                 "وضّح صفحة المنتج (صور حقيقية، المقاسات أو الأبعاد) وافحص الجودة قبل الشحن.",
                                  "Small effort; measure return rate on the same products.",
                                  "مجهود بسيط؛ قيس نسبة المرتجع على نفس المنتجات."),
-    "pre_dispatch_confirmation": ("Confirm size/colour with the customer before shipping.",
-                                  "أكّد المقاس واللون مع العميل قبل الشحن.", "Costs time; reduces wrong-item returns.",
+    "pre_dispatch_confirmation": ("Confirm the exact item (size, colour, model) with the customer before shipping.",
+                                  "أكّد مع العميل الصنف بالظبط (المقاس أو اللون أو الموديل) قبل الشحن.", "Costs time; reduces wrong-item returns.",
                                   "بياخد وقت؛ بيقلّل مرتجعات الطلب الغلط."),
     "compare_supplier_quotes": ("Ask current and alternative suppliers for written quotes on the same items.",
                                 "اطلب عروض أسعار مكتوبة من المورد الحالي وموردين تانيين لنفس الأصناف.",
@@ -431,6 +505,14 @@ OPTION_TEXT = {
     "review_prices": ("Check whether recent price cuts brought enough extra orders.",
                       "شوف هل تخفيض الأسعار الأخير جاب طلبات زيادة تكفي.", "Compare orders and margin before/after.",
                       "قارن الطلبات والهامش قبل وبعد."),
+    "bundle_offers": ("Offer bundles of products customers already buy together, at a small saving.",
+                      "اعمل عروض مجمّعة من منتجات العملاء بيشتروها مع بعض أصلاً، بتوفير بسيط.",
+                      "Raises items per order; keep the bundle discount smaller than the extra margin.",
+                      "بيزوّد عدد القطع في الطلب؛ خلّي خصم العرض أقل من الربح الزيادة."),
+    "suggest_add_ons": ("Suggest one add-on item at checkout or in the WhatsApp confirmation.",
+                        "اقترح قطعة إضافية واحدة وقت تأكيد الطلب أو في رسالة الواتساب.",
+                        "No cost; measure items per order for 2–4 weeks.",
+                        "من غير تكلفة؛ قيس عدد القطع في الطلب لمدة ٢-٤ أسابيع."),
     "compare_gateways": ("Compare payment providers' fees for your typical order size.",
                          "قارن رسوم شركات الدفع لحجم الطلب المعتاد عندك.", "Consider payout speed and reliability.",
                          "خد في اعتبارك سرعة تحويل الفلوس والاعتمادية."),
@@ -445,6 +527,24 @@ OPTION_TEXT = {
 }
 
 
+def _projection_text(driver: str, d: dict, monthly: float, lang: str) -> str:
+    cur, n, bp = d["currency"], d["current"]["orders"], d["base"]["period"]
+    revenue_side = driver in ("price_and_mix", "basket_size", "shipping_income")
+    if lang == "ar":
+        lbl = DRIVER_LABEL[driver]["ar"]
+        if revenue_side:
+            return (f"لو {lbl} رجع لمستوى {bp}، المكسب المتوقع حوالي {_fmt(monthly, cur, lang)} في الشهر على نفس "
+                    f"عدد الطلبات ({n}). ده تقدير مش مكسب حصل فعلاً.")
+        return (f"لو {lbl} لكل طلب رجع لمستوى {bp}، التوفير المتوقع حوالي {_fmt(monthly, cur, lang)} في الشهر على نفس "
+                f"عدد الطلبات ({n}). ده تقدير مش توفير حصل فعلاً.")
+    lbl = DRIVER_LABEL[driver]["en"]
+    if revenue_side:
+        return (f"If {lbl} returned to its {bp} level, you would keep about {_fmt(monthly, cur, lang)} more per month "
+                f"at the same order volume ({n} orders). This is an estimate, not a realised result.")
+    return (f"If {lbl} per order returned to its {bp} level, the projected saving is about {_fmt(monthly, cur, lang)} "
+            f"per month at the same order volume ({n} orders). This is an estimate, not a realised saving.")
+
+
 def recommendations(f: dict, d: dict, lang: str) -> list[dict]:
     ar = lang == "ar"
     cur = d["currency"]
@@ -457,12 +557,7 @@ def recommendations(f: dict, d: dict, lang: str) -> list[dict]:
     projection = {
         "type": "projection", "per_order": round(saving_per_order, 2), "monthly": round(monthly),
         "currency": cur,
-        "text": (f"لو {DRIVER_LABEL[f['driver']]['ar']} لكل طلب رجع لمستوى {d['base']['period']}، التوفير المتوقع حوالي "
-                 f"{_fmt(monthly, cur, lang)} في الشهر على نفس عدد الطلبات ({d['current']['orders']}). ده تقدير مش توفير "
-                 "حصل فعلاً." if ar else
-                 f"If {DRIVER_LABEL[f['driver']]['en']} per order returned to its {d['base']['period']} level, the "
-                 f"projected saving is about {_fmt(monthly, cur, lang)} per month at the same order volume "
-                 f"({d['current']['orders']} orders). This is an estimate, not a realised saving."),
+        "text": _projection_text(f["driver"], d, monthly, lang),
         "assumptions": ["same order volume and mix", f"returning to the {d['base']['period']} cost per order",
                         "no change in quality, returns or conversion"],
     }
@@ -539,7 +634,12 @@ def charts(m: dict, d: dict | None, cur: str | None) -> list[dict]:
         gap_cats = {g["category"] for g in d.get("gaps", [])}
         comps = [k for k in ["cogs", "packaging", "shipping", "payment_fees", "marketplace_fees", "discounts", "refunds"]
                  if k not in gap_cats]  # a month with no records is missing data, not a cost drop
+        comps_b = d["bridge"]["components"]
+        biggest = max(comps_b, key=lambda k: abs(comps_b[k])) if comps_b else None
         out.append({"id": "cost_per_order", "type": "grouped_bar", "currency": cur, "missing_months": sorted(gap_cats),
+                    # the cause named under the chart comes from the bridge (price / what customers buy / costs), not
+                    # from whichever bar moved most: bigger baskets raise product cost per order without any leak
+                    "biggest_driver": biggest if biggest and abs(comps_b[biggest]) > 0 else None,
                     "periods": [d["base"]["period"], d["current"]["period"]],
                     "series": {k: [round(d["base"]["per_order"][k]), round(d["current"]["per_order"][k])] for k in comps},
                     "estimated": d["base"]["estimated"] or d["current"]["estimated"],
@@ -549,9 +649,15 @@ def charts(m: dict, d: dict | None, cur: str | None) -> list[dict]:
                     "start": round(d["bridge"]["base_per_order"]), "end": round(d["bridge"]["current_per_order"]),
                     "steps": {k: round(v) for k, v in d["bridge"]["components"].items()},
                     "untested": d["untested"], "estimated": d["base"]["estimated"] or d["current"]["estimated"]})
+        # a margin % only means something for a product that really sold this month: refunds for items sold in
+        # earlier months can dwarf a small month's sales and give figures like -1553%
         prods = [p for p in m["products"] if p["currency"] == cur and p["period"] == d["current"]["period"]
-                 and p["product_margin"] is not None]
+                 and p["product_margin"] is not None and p["units"] >= 3 and p["net_sales"] > 0
+                 and p.get("refunds", 0) <= 0.5 * p.get("gross", p["net_sales"])]
         if prods:
+            # the 15 products that bring the most sales (the ones that matter), lowest margin first; a "worst
+            # margins" list is dominated by tiny one-off sales and tells the owner nothing
+            prods = sorted(prods, key=lambda p: -p["net_sales"])[:15]
             prods.sort(key=lambda p: p["product_margin_pct"] if p["product_margin_pct"] is not None else 0)
             out.append({"id": "products", "type": "bar", "currency": cur, "periods": [d["current"]["period"]],
                         "items": [{"product": p["product"], "margin_pct": p["product_margin_pct"],
@@ -575,6 +681,11 @@ def state(conn: sqlite3.Connection, iid: str, tenant: str, lang: str = "ar", bas
             f["explanation"] = explain(f, d, lang)
             f["recommendation"] = recommendations(f, d, lang)[0]
             f["label"] = DRIVER_LABEL[f["driver"]][lang]
+            if f["driver"] == "shipping":            # measured from the shop's own parcels, not a generic tip
+                from . import consolidation
+                est = consolidation.estimate(recs, cur, d["current"]["period"])
+                if est:
+                    f["recommendation"]["options"].append(consolidation.option(est, cur, lang, _fmt))
     order_view, o = None, None
     if cur and any(r["type"] == "sales" for r in recs):
         from . import orders as orders_mod, simulator
@@ -591,7 +702,7 @@ def state(conn: sqlite3.Connection, iid: str, tenant: str, lang: str = "ar", bas
         order_view["insights"] = orders_mod.insights(o, lang)
         order_view["allowed_allocation"] = orders_mod.ALLOWED
         order_view["simulator"] = {"period": last, "periods": sorted({x["period"] for x in o["orders"]}),
-                                   "capabilities": simulator.capabilities(o, last) if last else {}}
+                                   "capabilities": simulator._with_ar(simulator.capabilities(o, last)) if last else {}}
         order_view["monthly_contribution_total"] = sum(p["contribution"] for p in m["periods"] if p["currency"] == cur)
     from . import evidence as evidence_mod
     files = store.files(conn, iid)
@@ -614,6 +725,9 @@ def state(conn: sqlite3.Connection, iid: str, tenant: str, lang: str = "ar", bas
             "metrics": m, "main_currency": cur, "diagnosis": d, "questions": qs,
             "answers": _answers(conn, iid), "charts": charts(m, d, cur), "interventions": interventions,
             "definitions": metrics.DEFINITIONS, "summary": _import_summary(recs, m, lang)}
+    cost_curs = sorted({r["currency"] for r in recs if r["type"] == "product_costs"})
+    out["currency_mismatch"] = ({"sales_currency": cur, "cost_currencies": cost_curs}
+                                if cur and cost_curs and cur not in cost_curs else None)
     from . import actions as actions_mod, outreach as outreach_mod
     out["outreach"] = outreach_mod.list_for(conn, iid)
     out["actions"] = actions_mod.build(conn, iid, out, lang, tenant)

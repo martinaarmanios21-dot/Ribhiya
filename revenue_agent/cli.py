@@ -228,10 +228,13 @@ def cmd_serve(args) -> int:
             print(f"Port {args.port} is already used by another program.\n"
                   f"Run on a free port instead, e.g.:  uv run revenue-agent serve --port {args.port + 80}")
             return 1
-    from .web.auth import auth_configured
+    from .web.auth import auth_configured, config_error
+    if config_error():
+        print(f"Refusing to start: {config_error()}. Fix it in .env (a broken token setting would leave the API open).")
+        return 1
     if args.host not in ("127.0.0.1", "localhost", "::1") and not auth_configured() and not args.insecure:
         print(f"Refusing to listen on {args.host} without ADMIN_TOKEN (or TENANT_TOKENS): anyone on the network "
-              "could read and act on your invoices. Set ADMIN_TOKEN in .env, or pass --insecure if you really mean it.")
+              "could read and act on your business files. Set ADMIN_TOKEN in .env, or pass --insecure if you really mean it.")
         return 1
     if args.engine:
         os.environ["ENGINE"] = args.engine  # the web app reads settings from the environment

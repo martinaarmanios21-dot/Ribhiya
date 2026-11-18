@@ -64,10 +64,28 @@ def delete(conn: sqlite3.Connection, iid: str, tenant: str, actor: str) -> None:
         audit(conn, actor, "investigation_deleted", tenant=tenant, investigation=iid)
 
 
+def erase_tenant(conn: sqlite3.Connection, tenant: str, actor: str) -> dict:
+    """Erase EVERYTHING this business stored: investigations and their records/files, memory, settings, feedback,
+    budgets and audit entries. One audit marker without business content is kept to show the erase happened."""
+    iids = [r[0] for r in conn.execute("SELECT id FROM investigations WHERE tenant_id=?", (tenant,))]
+    counts: dict[str, int] = {}
+    with db.tx(conn):
+        for t in ("inv_records", "inv_files", "inv_questions", "interventions", "scenarios", "quotes", "outreach"):
+            counts[t] = sum(conn.execute(f"DELETE FROM {t} WHERE investigation_id=?", (i,)).rowcount for i in iids)
+        counts["investigations"] = conn.execute("DELETE FROM investigations WHERE tenant_id=?", (tenant,)).rowcount
+        for t in ("business_memory", "tenant_settings", "guide_feedback", "audit_log"):
+            counts[t] = conn.execute(f"DELETE FROM {t} WHERE tenant_id=?", (tenant,)).rowcount
+        counts["budget"] = conn.execute("DELETE FROM budget WHERE key LIKE ?", (f"%:tenant:{tenant}:%",)).rowcount
+        audit(conn, actor, "tenant_data_erased", tenant=tenant, investigations=len(iids))
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # with secure_delete on, the erased pages are overwritten
+    return counts
+
+
 # ------------------------------------------------------------------------------------------ files
 
 def add_file(conn: sqlite3.Connection, iid: str, filename: str, raw: bytes, *, tenant: str, actor: str,
-             date_format: str = "auto", overrides: dict | None = None, confirm: bool = False) -> dict:
+             date_format: str = "auto", overrides: dict | None = None, confirm: bool = False,
+             replacing: int | None = None) -> dict:
     """Parse a file and store its valid records. Uses an owner-confirmed mapping for the same layout if one exists.
     `confirm=True` with overrides records the mapping as owner-confirmed (business memory, reusable)."""
     inv = get(conn, iid, tenant)
@@ -92,8 +110,8 @@ def add_file(conn: sqlite3.Connection, iid: str, filename: str, raw: bytes, *, t
     for t in summary["tables"]:
         if t["sheet"] in reused:
             t["mapping_reused_from_memory"] = True
-    dup = conn.execute("SELECT id FROM inv_files WHERE investigation_id=? AND sha256=? AND status='imported'",
-                       (iid, fr.sha256)).fetchone()
+    dup = conn.execute("SELECT id FROM inv_files WHERE investigation_id=? AND sha256=? AND status='imported' AND id IS NOT ?",
+                       (iid, fr.sha256, replacing)).fetchone()
     status = "failed" if fr.fatal or not any(t.records for t in fr.tables) else "imported"
     if dup and status == "imported":
         summary["fatal"] = f"this exact file was already imported (file #{dup[0]}); nothing was added twice"

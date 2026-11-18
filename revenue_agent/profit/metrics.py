@@ -41,7 +41,7 @@ DEFINITIONS = {
                      "ar": "اللي بيفضل لك من كل طلب بعد تكلفة المنتج والتغليف والشحن والرسوم. الفلوس دي هي اللي "
                            "بتدفع الإيجار والمرتبات والإعلانات، واللي يفضل بعد كده هو الربح."},
     "contribution_margin": {"en": "Of every 100 in sales, how much is left after per-order costs.",
-                            "ar": "من كل ١٠٠ جنيه مبيعات، بيفضل كام بعد تكاليف الطلب."},
+                            "ar": "من كل ١٠٠ مبيعات، بيفضل كام بعد تكاليف الطلب."},
     "operating_profit": {"en": "Contribution minus marketing and fixed costs (rent, salaries, subscriptions).",
                          "ar": "اللي بيفضل بعد كمان الإعلانات والمصاريف الثابتة (إيجار، مرتبات، اشتراكات)."},
     "aov": {"en": "Average money a customer pays per order.", "ar": "متوسط اللي العميل بيدفعه في الطلب الواحد."},
@@ -61,13 +61,32 @@ def period_of(d: str) -> str:
     return d[:7]
 
 
+class CostTable(dict):
+    """Unit cost per (product, currency). Exact SKU match first (15056BL and 15056bl can be different products);
+    a case-insensitive match is used only when it is unambiguous (one cost for all spellings)."""
+
+    def __init__(self, records: list[dict], currency: str | None = None):
+        super().__init__()
+        self._lower: dict[tuple, set] = {}
+        for r in records:
+            if r["type"] == "product_costs" and r.get("unit_cost_minor") is not None and \
+                    (currency is None or r.get("currency") == currency):
+                p = (r["product"] or "").strip()
+                self[(p, r["currency"])] = r["unit_cost_minor"]
+                self._lower.setdefault((p.lower(), r["currency"]), set()).add(r["unit_cost_minor"])
+
+    def lookup(self, product: str | None, currency: str) -> int | None:
+        p = (product or "").strip()
+        if (p, currency) in self:
+            return self[(p, currency)]
+        found = self._lower.get((p.lower(), currency), set())
+        return next(iter(found)) if len(found) == 1 else None
+
+
 def compute(records: list[dict]) -> dict:
     """All metrics for all periods and currencies, plus coverage information. Pure function of the records."""
     sales = [r for r in records if r["type"] == "sales"]
-    costs = {}
-    for r in records:
-        if r["type"] == "product_costs" and r.get("unit_cost_minor") is not None:
-            costs[(r["product"] or "").strip().lower(), r["currency"]] = r["unit_cost_minor"]
+    costs = CostTable(records)
     expenses = [r for r in records if r["type"] == "expenses"]
     returns = [r for r in records if r["type"] == "returns"]
     has_returns_file = bool(returns)
@@ -97,7 +116,7 @@ def compute(records: list[dict]) -> dict:
         pr["units"] += s["quantity"]
         pr["gross"] += s["gross_minor"]
         pr["discounts"] += s["discount_minor"]
-        uc = costs.get((prod.lower(), s["currency"]))
+        uc = costs.lookup(prod, s["currency"])
         if uc is not None:
             c = round(uc * s["quantity"])
             p["cogs"] += c
@@ -168,7 +187,11 @@ def compute(records: list[dict]) -> dict:
             "per_order": {"net_sales": per(net), "gross_sales": per(p["gross_sales"]), "discounts": per(p["discounts"]),
                           "shipping_income": per(ship_income),
                           "refunds": per(p["refunds"]), "cogs": per(cogs), **{c: per(v) for c, v in var.items()},
-                          "contribution": per(contribution)},
+                          "contribution": per(contribution),
+                          # basket view (items, not money): lets the bridge separate "bigger baskets" from price/cost
+                          "units": p["units"] / orders if orders else None,
+                          "gross_per_unit": p["gross_sales"] / p["units"] if p["units"] else None,
+                          "cogs_per_unit": cogs / p["units"] if p["units"] else None},
             "aov": per(net), "return_rate": _ratio(p["returned_units"], p["units"]) if has_returns_file or
             p["returned_units"] else None,
             "break_even_orders": (round((p["exp_marketing"] + fixed_total) / per(contribution), 1)
@@ -183,7 +206,8 @@ def compute(records: list[dict]) -> dict:
     prod_rows = []
     for (period, cur, name), pr in sorted(products.items()):
         net = pr["gross"] - pr["discounts"] - pr["refunds"]
-        prod_rows.append({"period": period, "currency": cur, "product": name, "units": round(pr["units"], 2),
+        prod_rows.append({"period": period, "currency": cur, "product": name, "units": pr["units"],
+                          "gross": pr["gross"], "cogs_line": pr["cogs"], "refunds": pr["refunds"],
                           "net_sales": net, "cogs": pr["cogs"] if pr["cost_known"] else None,
                           "product_margin": (net - pr["cogs"]) if pr["cost_known"] else None,
                           "product_margin_pct": _ratio(net - pr["cogs"], net) if pr["cost_known"] else None})
@@ -198,10 +222,47 @@ def compute(records: list[dict]) -> dict:
             "has_product_costs": bool(costs), "currencies": sorted({p["currency"] for p in periods})}
 
 
-def contribution_bridge(base: dict, cur: dict) -> dict:
+def _product_split(base: dict, cur: dict, products: list[dict]) -> dict:
+    """Split Δ(gross − cogs) per order using each product's own price and cost in both months:
+      price_and_mix  = Σ current units × (current − base price) of the same product        (like-for-like prices)
+      product_costs  = −Σ current units × (current − base unit cost) of the same product   (like-for-like costs)
+      basket_size    = the rest: how many items and WHICH items customers buy, valued at base prices and costs
+    A product new this month has no "base" price or cost, so its whole effect is in basket_size. Without this, a
+    shift to pricier items (or bigger baskets) looks like "product costs went up" even though no cost changed.
+    The three sum exactly to Δgross/order − Δcogs/order."""
+    cur_code = cur["currency"]
+    by = {}
+    for p in products:
+        if p["currency"] == cur_code and p["period"] in (base["period"], cur["period"]):
+            by.setdefault(p["product"], {})[p["period"]] = p
+    nb, nc = base["orders"], cur["orders"]
+    price = cost = basket_cur = 0.0
+    lfl_base_sales = lfl_base_cost = 0.0  # current units valued at base price / cost (products sold in both months)
+    for prod in by.values():
+        c = prod.get(cur["period"])
+        if not c or not c["units"]:
+            continue
+        b = prod.get(base["period"])
+        pc, cc = c["gross"] / c["units"], c["cogs_line"] / c["units"]
+        pb, cb = (b["gross"] / b["units"], b["cogs_line"] / b["units"]) if b and b["units"] else (pc, cc)
+        price += c["units"] * (pc - pb)
+        cost -= c["units"] * (cc - cb)
+        basket_cur += c["units"] * (pb - cb)
+        if b and b["units"]:
+            lfl_base_sales += c["units"] * pb
+            lfl_base_cost += c["units"] * cb
+    margin_base = (base["gross_sales"] - base["cogs"]) / nb
+    return {"price_and_mix": price / nc, "product_costs": cost / nc, "basket_size": basket_cur / nc - margin_base,
+            # evidence: how much the SAME products' prices/costs moved, in % (not the average per item, which
+            # also moves when customers pick different products)
+            "_like_for_like": {"price_pct": _ratio(price, lfl_base_sales), "cost_pct": _ratio(-cost, lfl_base_cost)}}
+
+
+def contribution_bridge(base: dict, cur: dict, products: list[dict] | None = None) -> dict:
     """Exact per-order decomposition of the change in contribution per order between two periods (same currency):
     Δcontribution/order = Δgross/order − Δdiscounts/order + Δshipping_income/order − Δrefunds/order − Δcogs/order
-                          − Σ Δvariable/order.
+                          − Σ Δvariable/order. With product rows, Δgross − Δcogs is split into like-for-like price,
+                          like-for-like product cost, and what customers buy (basket_size).
     Every component is reported in minor units per order; the components sum to the total change."""
     if base["currency"] != cur["currency"]:
         raise ValueError("periods have different currencies")
@@ -211,7 +272,12 @@ def contribution_bridge(base: dict, cur: dict) -> dict:
     comps = {"price_and_mix": c["gross_sales"] - b["gross_sales"], "discounts": -(c["discounts"] - b["discounts"]),
              "shipping_income": (c.get("shipping_income") or 0) - (b.get("shipping_income") or 0),
              "refunds": -(c["refunds"] - b["refunds"]), "product_costs": -(c["cogs"] - b["cogs"]),
-             **{k: -(c[k] - b[k]) for k in VARIABLE}}
+             "basket_size": 0.0, **{k: -(c[k] - b[k]) for k in VARIABLE}}
+    lfl = None
+    if products is not None:
+        split = _product_split(base, cur, products)
+        lfl = split.pop("_like_for_like")
+        comps.update(split)
     total = c["contribution"] - b["contribution"]
     comps = {k: round(v, 2) for k, v in comps.items()}
     return {"base_period": base["period"], "current_period": cur["period"], "currency": cur["currency"],
@@ -221,4 +287,4 @@ def contribution_bridge(base: dict, cur: dict) -> dict:
             "orders_base": base["orders"], "orders_current": cur["orders"],
             "total_contribution_change": cur["contribution"] - base["contribution"],
             "volume_effect": round((cur["orders"] - base["orders"]) * b["contribution"], 2),
-            "rate_effect": round(cur["orders"] * total, 2)}
+            "rate_effect": round(cur["orders"] * total, 2), "like_for_like": lfl}

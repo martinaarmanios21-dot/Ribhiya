@@ -16,6 +16,9 @@ from dataclasses import dataclass
 
 from ..ledger.store import DEFAULT_TENANT
 
+ADMIN_MIN_LEN = 24
+TENANT_MIN_LEN = 12
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "testserver"}
 MEMBER_PREFIXES = ("/api/status", "/api/audit", "/api/investigations", "/api/memory", "/api/profit/", "/api/guide/")
 _TENANT_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 
@@ -38,6 +41,25 @@ def _tokens() -> list[tuple[str, str, str]]:
         if token and len(token) >= 12 and _TENANT_ID.match(tenant):
             out.append((token, tenant, "member"))
     return out
+
+
+def config_error() -> str | None:
+    """A token setting that is present but unusable must never fall back to the open local mode."""
+    admin = os.environ.get("ADMIN_TOKEN", "").strip()
+    if admin and len(admin) < ADMIN_MIN_LEN:
+        return f"ADMIN_TOKEN must be at least {ADMIN_MIN_LEN} characters"
+    raw = [i.strip() for i in os.environ.get("TENANT_TOKENS", "").split(",") if i.strip()]
+    seen: set[str] = {admin} if admin else set()
+    for item in raw:
+        tenant, _, token = item.partition(":")
+        tenant, token = tenant.strip().lower(), token.strip()
+        if not _TENANT_ID.match(tenant) or len(token) < TENANT_MIN_LEN:
+            return (f"TENANT_TOKENS entry for '{tenant or '?'}' is invalid (tenant id a-z0-9_-, token at least "
+                    f"{TENANT_MIN_LEN} characters)")
+        if token in seen:
+            return "TENANT_TOKENS contains the same token twice (or reuses ADMIN_TOKEN)"
+        seen.add(token)
+    return None
 
 
 def auth_configured() -> bool:

@@ -7,12 +7,15 @@ live-provider behaviour. All business data is fictional TEST-ONLY fixture data i
 """
 
 import httpx
+import json
+import subprocess
+
 import pytest
 
 from profit_fixtures import costs_csv, expenses_csv, sales_csv
 from revenue_agent import db, guide, llm
 from revenue_agent.ai_safety import sanitize_answer
-from revenue_agent.profit import advisor, store
+from revenue_agent.profit import advisor, diagnosis, store
 
 FAKE_KEY = "AIzaSyFAKEFAKEFAKEFAKEFAKEFAKE1234567"
 T = "default"
@@ -153,3 +156,63 @@ def test_09_removed_collections_endpoints_are_gone():
                  "/api/strategy/evaluation"):
         assert c.get(path).status_code == 404, path
     assert c.post("/api/agent/chat", json={"message": "hi"}).status_code in (404, 405)  # no handler at all
+
+
+def test_07_ai_needs_consent_per_business_in_multi_business_mode(conn, inv, monkeypatch):
+    from revenue_agent.profit import ai_policy
+    fake = use(monkeypatch, FakeProvider(["From the numbers, packaging rose."]))
+    monkeypatch.setenv("TENANT_TOKENS", "default:default-token-123456")
+    r = advisor.ask(conn, inv, tenant=T, question="why is profit down?", lang="en", actor="o")
+    assert r["mode"] == "rules" and r["notice"] == "ai_off_for_this_business" and not fake.requests  # nothing sent
+    ai_policy.set_enabled(conn, T, True, "o")
+    assert advisor.ask(conn, inv, tenant=T, question="why?", lang="en", actor="o")["mode"] == "api"
+    assert len(fake.requests) == 1
+    monkeypatch.delenv("TENANT_TOKENS")
+    assert ai_policy.default() is True       # a self-hosted single business uses its own key
+
+
+def test_08_one_business_cannot_use_up_the_shared_ai_budget(conn, inv, monkeypatch):
+    fake = use(monkeypatch, FakeProvider(["Packaging rose."]))
+    monkeypatch.setenv("TENANT_DAILY_LLM_CALL_CAP", "2")
+    modes = [advisor.ask(conn, inv, tenant=T, question="why?", lang="en", actor="o")["mode"] for _ in range(3)]
+    assert modes == ["api", "api", "rules"] and len(fake.requests) == 2
+    row = conn.execute("SELECT used FROM budget WHERE key LIKE 'day:%:tenant:default:calls'").fetchone()
+    assert row[0] == 2
+
+
+def test_09_ai_settings_endpoint_is_per_business(monkeypatch):
+    from fastapi.testclient import TestClient
+    from revenue_agent.web.app import app
+    monkeypatch.setenv("TENANT_TOKENS", "acme:acme-token-123456,beta:beta-token-123456")
+    A, B = {"X-Tahsila-Token": "acme-token-123456"}, {"X-Tahsila-Token": "beta-token-123456"}
+    c = TestClient(app)
+    assert c.get("/api/profit/ai-settings", headers=A).json()["ai_enabled"] is False
+    assert c.put("/api/profit/ai-settings", headers=A, json={"ai_enabled": True}).json()["ai_enabled"] is True
+    assert c.get("/api/profit/ai-settings", headers=B).json()["ai_enabled"] is False
+    assert c.put("/api/profit/ai-settings", headers=A, json={"ai_enabled": "yes"}).status_code == 422
+    assert "customer names, phones or emails" in c.get("/api/profit/ai-settings", headers=A).json()["never_sent"]
+
+
+def test_10_customer_names_and_phones_never_reach_the_ai_summary(conn):
+    iid = store.create(conn, title="t")["id"]
+    raw = ("Order ID,Date,Product,Quantity,Unit Price,Customer\n" + "".join(
+        f"O{i},2026-0{8 + i % 2}-{i % 27 + 1:02d},Mug,1,100,Mona Hassan 0100123{i:04d}\n" for i in range(80))).encode()
+    store.add_file(conn, iid, "s.csv", raw, tenant=T, actor="o")
+    text = json.dumps(advisor.compact(diagnosis.state(conn, iid, T, "en"), "en"), ensure_ascii=False, default=str)
+    assert "Mona" not in text and "0100123" not in text
+
+
+def test_11_hermes_failure_trips_a_breaker_so_owners_dont_wait(conn, inv, monkeypatch):
+    calls = []
+    def slow_fail(*a, **k):
+        calls.append(1)
+        raise subprocess.TimeoutExpired("hermes", 45)
+    monkeypatch.setattr(advisor, "hermes_ready", lambda tenant="default": True)
+    monkeypatch.setattr(advisor, "_hermes", slow_fail)
+    monkeypatch.setattr(advisor, "_HERMES_DOWN_UNTIL", [0.0])
+    monkeypatch.setenv("PROFIT_ADVISOR_ENGINE", "auto")
+    use(monkeypatch, FakeProvider(["Packaging rose."]))
+    first = advisor.ask(conn, inv, tenant=T, question="why?", lang="en", actor="o")
+    second = advisor.ask(conn, inv, tenant=T, question="why?", lang="en", actor="o")
+    assert first["mode"] == "api" and second["mode"] == "api" and len(calls) == 1
+    assert second["notice"] == "hermes_paused_after_failure"

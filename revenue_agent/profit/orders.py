@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+from . import metrics
 from .ingest import VARIABLE
 
 DEFAULT_ALLOCATION = {"packaging": "per_order", "shipping": "per_order", "payment_fees": "by_value",
@@ -71,8 +72,7 @@ def validate_allocation(allocation: dict | None) -> dict:
 
 def compute(records: list[dict], currency: str, allocation: dict | None = None) -> dict:
     alloc = validate_allocation(allocation)
-    costs = {(r["product"] or "").strip().lower(): r["unit_cost_minor"] for r in records
-             if r["type"] == "product_costs" and r.get("currency") == currency and r.get("unit_cost_minor") is not None}
+    costs = metrics.CostTable(records, currency)
     returns = [r for r in records if r["type"] == "returns" and r.get("currency") == currency]
     has_returns = bool([r for r in records if r["type"] == "returns"])
     orders: dict[str, dict] = {}
@@ -87,7 +87,7 @@ def compute(records: list[dict], currency: str, allocation: dict | None = None) 
         o["period"] = o["date"][:7]
         o["channel"] = o["channel"] or s.get("channel")
         net = s["gross_minor"] - s["discount_minor"]
-        uc = costs.get((s.get("product") or "").strip().lower())
+        uc = costs.lookup(s.get("product"), currency)
         line = {"product": (s.get("product") or "(unnamed)").strip(), "quantity": s["quantity"], "net": net,
                 "gross": s["gross_minor"], "discount": s["discount_minor"],
                 "cogs": round(uc * s["quantity"]) if uc is not None else None}
@@ -255,30 +255,43 @@ def _group(rows: list[dict], key) -> list[dict]:
              if v["orders"] - v["incomplete"] else None} for k, v in sorted(G.items())]
 
 
+MIN_PRODUCT_ORDERS = 3  # a product needs this many orders before its margin is compared with others
+
+
 def insights(o: dict, lang: str) -> list[dict]:
     """Plain-language observations computed from the order-level result (no new numbers are made up here)."""
     from ..ledger.csv_import import money_fmt
     ar, cur, out = lang == "ar", o["currency"], []
     prods = [p for p in o["products"] if p["contribution"] is not None and p["units"] > 0]
     if len(prods) >= 2:
-        top_sales = max(prods, key=lambda p: p["net_sales"])
-        best = max(prods, key=lambda p: p["contribution_per_unit"] if p["contribution_per_unit"] is not None else -1e18)
-        worst_margin = min(prods, key=lambda p: p["contribution_margin"] if p["contribution_margin"] is not None else 1e9)
-        if top_sales["product"] != best["product"]:
+        # Compare margins (of every 100 sold), not profit per unit: a 165-pound mirror always "leaves more per unit"
+        # than a 12-pound mug. Only products sold in a few orders count, and the top seller must be clearly below the
+        # shop's own margin, so the message is about a real pricing/cost problem, not price points or one-off sales.
+        eligible = [p for p in prods if p.get("orders", 0) >= MIN_PRODUCT_ORDERS and p["contribution_margin"] is not None]
+        net_all = sum(p["net_sales"] for p in eligible)
+        shop_margin = sum(p["contribution"] for p in eligible) / net_all if net_all > 0 else None
+        top_sales = max(eligible, key=lambda p: p["net_sales"]) if eligible else None
+        best = max(eligible, key=lambda p: p["contribution_margin"]) if eligible else None
+        if top_sales and best and shop_margin is not None and top_sales["product"] != best["product"] and \
+                top_sales["contribution_margin"] < shop_margin - 0.10 and \
+                best["contribution_margin"] - top_sales["contribution_margin"] >= 0.15:
+            tm, bm = top_sales["contribution_margin"] * 100, best["contribution_margin"] * 100
+            tu, bu = (money_fmt(round(x["contribution_per_unit"]), cur, lang) for x in (top_sales, best))
             out.append({"kind": "top_seller_not_top_earner", "product": top_sales["product"], "other": best["product"],
                         "text": (f"«{top_sales['product']}» أكتر منتج بيجيب مبيعات ({money_fmt(top_sales['net_sales'], cur, lang)})، "
-                                 f"بس كل قطعة منه بتسيبلك {money_fmt(round(top_sales['contribution_per_unit']), cur, lang)} بس، "
-                                 f"وقطعة «{best['product']}» بتسيبلك {money_fmt(round(best['contribution_per_unit']), cur, lang)}. "
-                                 "المبيعات الكبيرة مش دايماً معناها ربح أكبر لو تكلفة المنتج والتغليف والشحن عالية."
+                                 f"بس كل ١٠٠ من مبيعاته بتسيبلك {tm:.0f} بس ({tu} للقطعة)، و«{best['product']}» "
+                                 f"بتسيب {bm:.0f} من كل ١٠٠ ({bu} للقطعة). راجع سعره أو تكلفته، أو اعرض المنتجات "
+                                 "اللي هامشها أعلى."
                                  if ar else
                                  f"“{top_sales['product']}” brings the most sales ({money_fmt(top_sales['net_sales'], cur, lang)}), "
-                                 f"but each unit leaves only {money_fmt(round(top_sales['contribution_per_unit']), cur, lang)}, while "
-                                 f"“{best['product']}” leaves {money_fmt(round(best['contribution_per_unit']), cur, lang)} per unit. "
-                                 "High sales don't mean high profit when product, packaging and delivery costs are high.")})
-        if worst_margin["contribution_margin"] is not None and worst_margin["contribution_margin"] < 0:
+                                 f"but leaves only {tm:.0f} of every 100 sold ({tu} per unit), while “{best['product']}” "
+                                 f"leaves {bm:.0f} of every 100 ({bu} per unit). Review its price or cost, or feature "
+                                 "your higher-margin products.")})
+        worst_margin = min(eligible, key=lambda p: p["contribution_margin"]) if eligible else None
+        if worst_margin and worst_margin["contribution_margin"] < 0:
             out.append({"kind": "loss_product", "product": worst_margin["product"],
-                        "text": (f"«{worst_margin['product']}» بيخسّرك: بعد كل التكاليف كل ١٠٠ جنيه مبيعات بتسيب "
-                                 f"{worst_margin['contribution_margin'] * 100:.0f} جنيه." if ar else
+                        "text": (f"«{worst_margin['product']}» بيخسّرك: بعد كل التكاليف كل ١٠٠ من مبيعاته بتسيب "
+                                 f"{worst_margin['contribution_margin'] * 100:.0f}." if ar else
                                  f"“{worst_margin['product']}” loses money: after all order costs, every 100 of sales leaves "
                                  f"{worst_margin['contribution_margin'] * 100:.0f}.")})
     if o["loss_order_count"]:

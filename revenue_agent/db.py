@@ -369,6 +369,14 @@ CREATE TABLE IF NOT EXISTS business_memory (
     updated_at REAL NOT NULL,
     UNIQUE (tenant_id, kind, key)
 );
+CREATE TABLE IF NOT EXISTS tenant_settings (     -- per-business choices, e.g. whether AI providers may be used
+    tenant_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (tenant_id, key)
+);
+
 CREATE TABLE IF NOT EXISTS guide_feedback (     -- reviews, bug reports and feature ideas from the in-app guide
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tenant_id TEXT NOT NULL,
@@ -407,6 +415,10 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=15, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA secure_delete=ON")  # deleted business data is overwritten, not left recoverable in the file
+    for f in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+        if f.exists() and f.stat().st_mode & 0o077:
+            f.chmod(0o600)  # owner-only: the file holds every business's sales and customer records
     key = str(db_path.resolve())
     if key not in _INITIALISED or not db_path.exists():
         with _INIT_LOCK:

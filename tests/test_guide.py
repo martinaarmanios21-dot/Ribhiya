@@ -171,6 +171,14 @@ def test_fix_questions_list_the_findings_own_options(conn):
     assert ask(conn, "أعمل إيه عشان أصلّحها؟", "ar", investigation=iid)["topic"] == "solutions"
 
 
+def test_a_specific_what_should_i_do_question_goes_to_the_advisor(conn, monkeypatch):
+    monkeypatch.setenv("PROFIT_ADVISOR_ENGINE", "rules")
+    iid = _inv(conn)
+    assert ask(conn, "أعمل إيه دلوقتي؟", "ar", investigation=iid)["topic"] == "next"
+    for q in ("لو الدولار زاد تاني أعمل إيه؟", "أعمل إيه في أسعار المنتجات؟", "لو المبيعات قلت أعمل إيه؟"):
+        assert ask(conn, q, "ar", investigation=iid)["source"] == "your_numbers", q
+
+
 def test_missing_and_why_answers_come_from_the_evidence_register(conn):
     iid = _inv(conn)
     r = ask(conn, "What files are missing?", "en", investigation=iid)

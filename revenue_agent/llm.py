@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import os
 import sqlite3
 import threading
 import time
@@ -63,11 +64,53 @@ def _bump(conn: sqlite3.Connection, key: str, amount: float, cap: float) -> tupl
     return used + amount, cap
 
 
-def reserve_call(conn: sqlite3.Connection, run_id: str | None, settings: Settings) -> None:
-    """Reserve one LLM call against the daily and per-run caps *before* calling (fail closed)."""
-    _bump(conn, f"day:{date.today().isoformat()}:calls", 1, settings.daily_llm_call_cap)
+def tenant_daily_cap() -> int:
+    """AI calls per business per day, so one business can't use up the shared daily budget of all the others."""
+    try:
+        return max(0, int(os.environ.get("TENANT_DAILY_LLM_CALL_CAP", "40")))
+    except ValueError:
+        return 40
+
+
+def tenant_monthly_cap() -> int:
+    """AI calls per business per calendar month. This is what bounds the running cost of one business: at about
+    1.2 EGP per call (Gemini Flash, ~4,900 tokens) 40 calls cost at most ~50 EGP a month."""
+    try:
+        return max(0, int(os.environ.get("TENANT_MONTHLY_LLM_CALL_CAP", "40")))
+    except ValueError:
+        return 40
+
+
+def month_key(tenant: str) -> str:
+    return f"month:{date.today().strftime('%Y-%m')}:tenant:{tenant}:calls"
+
+
+def tenant_month_usage(conn: sqlite3.Connection, tenant: str) -> dict:
+    row = conn.execute("SELECT used FROM budget WHERE key=?", (month_key(tenant),)).fetchone()
+    return {"used": int(row[0]) if row else 0, "cap": tenant_monthly_cap()}
+
+
+def reserve_call(conn: sqlite3.Connection, run_id: str | None, settings: Settings, tenant: str | None = None,
+                 weight: int = 1) -> None:
+    """Reserve `weight` LLM calls against the monthly and daily per-business caps, the global daily cap and the
+    per-run cap *before* calling (fail closed). If a later cap refuses, the earlier reservations are given back."""
+    done: list[str] = []
+    keys = []
+    if tenant:
+        keys += [(month_key(tenant), tenant_monthly_cap()),
+                 (f"day:{date.today().isoformat()}:tenant:{tenant}:calls", tenant_daily_cap())]
+    keys.append((f"day:{date.today().isoformat()}:calls", settings.daily_llm_call_cap))
     if run_id:
-        _bump(conn, f"run:{run_id}:calls", 1, settings.run_llm_call_cap)
+        keys.append((f"run:{run_id}:calls", settings.run_llm_call_cap))
+    try:
+        for key, cap in keys:
+            _bump(conn, key, weight, cap)
+            done.append(key)
+    except BudgetExceeded:
+        with db.tx(conn):
+            for key in done:
+                conn.execute("UPDATE budget SET used = used - ? WHERE key=?", (weight, key))
+        raise
 
 
 def record_tokens(conn: sqlite3.Connection, run_id: str | None, tokens: int, settings: Settings) -> None:
@@ -117,10 +160,12 @@ def extract_json(text: str) -> dict:
 # ------------------------------------------------------------------ client
 
 class LLMClient:
-    def __init__(self, conn: sqlite3.Connection, settings: Settings | None = None, run_id: str | None = None):
+    def __init__(self, conn: sqlite3.Connection, settings: Settings | None = None, run_id: str | None = None,
+                 tenant: str | None = None):
         self.conn = conn
         self.settings = settings or get_settings()
         self.run_id = run_id
+        self.tenant = tenant
         self.calls = 0
         self.tokens = 0
         self.tokens_in = 0
@@ -144,7 +189,7 @@ class LLMClient:
                 if remaining is not None and remaining < 1.0:
                     raise DeadlineExceeded("request time budget exhausted")
                 check_token_budget(self.conn, self.run_id)
-                reserve_call(self.conn, self.run_id, self.settings)
+                reserve_call(self.conn, self.run_id, self.settings, self.tenant)
                 _wait_for_slot(provider, spec["rpm"])
                 started = time.monotonic()
                 body_json = {"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens}

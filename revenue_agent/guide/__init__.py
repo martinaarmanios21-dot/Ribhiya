@@ -22,6 +22,7 @@ import time
 from .. import db
 from ..config import get_settings
 from ..ai_safety import bump_session_tokens, sanitize_answer
+from ..profit import ai_policy
 from ..ledger.store import audit
 from ..llm import BudgetExceeded, KillSwitchOn, LLMClient, LLMError
 from . import content as C
@@ -145,7 +146,8 @@ def _kb(lang: str) -> str:
 _URL = re.compile(r"(https?://|www\.)\S+", re.I)
 
 
-def _llm(conn: sqlite3.Connection, message: str, history: list, lang: str, session_id: str | None) -> str:
+def _llm(conn: sqlite3.Connection, message: str, history: list, lang: str, session_id: str | None,
+         tenant: str | None = None) -> str:
     s = get_settings()
     session_key = f"session:{session_id}:tokens" if session_id else None
     if session_key:
@@ -160,7 +162,7 @@ def _llm(conn: sqlite3.Connection, message: str, history: list, lang: str, sessi
         if isinstance(h, dict) and h.get("role") in ("user", "assistant") and isinstance(h.get("text"), str):
             msgs.append({"role": h["role"], "content": h["text"][:800]})
     msgs.append({"role": "user", "content": message})
-    client = LLMClient(conn, s, run_id=None)
+    client = LLMClient(conn, s, run_id=None, tenant=tenant)
     r = client.chat(msgs, purpose="guide_chat", max_tokens=min(s.max_output_tokens, 800), temperature=0.2,
                     deadline=time.monotonic() + min(s.max_request_seconds, 40.0))
     if session_key:
@@ -176,6 +178,11 @@ CONTEXT_INTENTS: dict[str, list[str]] = {
                    "محتاج ده ليه"],
     "missing": ["missing", "ناقص", "ناقصه", "what files", "which files", "ملفات ايه", "انهي ملفات"],
 }
+# A "what should I do" that names a topic or asks "what if" is a question about the shop's numbers, not about the
+# next step of the investigation: «لو الدولار زاد أعمل إيه؟» goes to the data advisor.
+CONDITIONAL_WORDS = {"لو", "if"}   # matched as whole words («لو» is inside «دلوقتي»)
+SPECIFIC_WORDS = ["دولار", "dollar", "سعر", "اسعار", "price", "منتج", "product", "ستيكر", "مرتجع", "return",
+                  "اعلان", "ads", "مكسب", "ربح", "profit", "هامش", "margin", "عميل", "عملاء", "customer", "مورد", "supplier"]
 USAGE_WORDS = ["ازاي", "فين", "how do i", "how to", "how does", "where", "استخدم", "بيشتغل"]
 _ACTION_GO = {"request_quotes": "suppliers", "await_reply": "suppliers", "compare": "suppliers", "moq": "suppliers",
               "track": "whatif", "verify": "results"}
@@ -303,9 +310,10 @@ def ask(conn: sqlite3.Connection, *, message: str, lang: str, tenant: str, actor
     else:
         out = None
         engine = os.environ.get("GUIDE_ENGINE", "auto").strip().lower()
-        if engine in ("auto", "api") and s.available_providers() and not db.kill_switch_on(conn):
+        if engine in ("auto", "api") and s.available_providers() and not db.kill_switch_on(conn) and \
+                ai_policy.enabled(conn, tenant):
             try:
-                text = _llm(conn, message, history or [], lang, session_id)
+                text = _llm(conn, message, history or [], lang, session_id, tenant)
                 if text:
                     out, mode = {"answer": text, "topic": None, "actions": [], "links": []}, "api"
             except (LLMError, BudgetExceeded, KillSwitchOn) as exc:
@@ -329,7 +337,7 @@ def _in_investigation(conn: sqlite3.Connection, st: dict, m: dict, *, message: s
     iid = st["investigation"]["id"]
     if "solutions" in m["intents"] and m["kind"] != "concept":  # before "next": "اعمل ايه عشان…" is a fix question
         return _solutions_answer(conn, tenant, lang, iid) | {"source": "state"}
-    if hit(CONTEXT_INTENTS["next"]):
+    if hit(CONTEXT_INTENTS["next"]) and not hit(SPECIFIC_WORDS) and not CONDITIONAL_WORDS & set(msg.split()):
         return _next_answer(st, lang) | {"source": "state"}
     if hit(CONTEXT_INTENTS["why_needed"]):
         return _why_answer(st, lang) | {"source": "state"}

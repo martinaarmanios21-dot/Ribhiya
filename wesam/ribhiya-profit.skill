@@ -1,0 +1,35 @@
+---
+name: ribhiya-profit
+description: Explain profit findings, what-if projections and win-back results from the Ribhiya MCP tools to a small-business owner in Egyptian Arabic, without inventing numbers.
+---
+
+# Explaining Ribhiya results
+
+## Findings (`ribhiya_findings`)
+Each finding has `driver`, `what`, `evidence`, `caveats`, `options`, `projection`.
+- Lead with `what` (one sentence), then the monthly impact from `projection`, then the first option.
+- Drivers in plain words:
+  - `price_and_mix` → "بقيت تبيع نفس المنتجات بسعر أقل" (same products, lower price; not a change in what customers buy). Check recent discounts/price cuts.
+  - `basket_size` → "العملاء بيشتروا قطع أقل أو أرخص في الطلب". Suggest bundles or a free-shipping threshold.
+  - `product_costs` → the same products cost more. Suggest quotes from 2–3 suppliers for the same spec.
+  - `refunds` → returns rose. If a caveat says one return is a large share, call it a possible one-off.
+  - `packaging`, `shipping`, `payment_fees`, `marketplace_fees` → that cost per order rose.
+- `confidence: preliminary` → say "مبدئياً" and why (few orders or missing data).
+- If `findings` is empty, read `note` / `missing_evidence` and ask for the next file.
+
+## What-if (`ribhiya_what_if`)
+Say: "لو عملت كده على طلبات شهر X، الربح هيتغير حوالي Y. ده تقدير مش نتيجة." Mention the first assumption.
+Useful scenarios: `{"price_change_pct": {"all": 5}}`, `{"price_change_pct": {"all": 5}, "volume_change_pct": -10}`,
+`{"return_rate_pct": 3}`, `{"free_shipping": {"threshold": "800", "fee": "50"}}`, `{"packaging_per_order": "12.5"}`.
+
+## Grow sales (`ribhiya_grow`)
+- Repeat rate and top-20% share first (one line each).
+- Win-back: draft one WhatsApp message from `message_template`; remind the owner to message only the listed
+  customers and leave the comparison group alone. If `preliminary` is set, say the list may include customers who
+  would come back anyway.
+- `measured_result` is the only revenue you may call a result.
+- Bundles: one line per bundle, as an offer idea.
+
+## Example (Egyptian Arabic)
+> كل طلب بقى بيجيب ١٥٫٤١ جنيه أقل لأنك بقيت تبيع نفس المنتجات بسعر أقل — يعني حوالي ٢٬٧٢٧ جنيه أقل في الشهر (تقدير).
+> أول حاجة نراجعها: الخصومات أو تخفيضات الأسعار الشهر اللي فات. تحب نجرّب رفع السعر ٥٪ ونشوف تأثيره؟

@@ -33,6 +33,16 @@ can act: no AI path can send, approve, upload, delete, change settings or touch 
   feedback and audit entries are tenant-scoped in every query; another business's ID behaves like a missing one
   (`test_api_full_workflow_and_tenant_isolation`, `test_07_access_control_and_tenant_isolation_over_http`).
 - **[code]** `revenue-agent serve` refuses a non-local bind without a token (override: `--insecure`).
+- **[code]** Fail closed on bad settings: a `TENANT_TOKENS` entry with a bad tenant id or a token under 12 characters,
+  an `ADMIN_TOKEN` under 24 characters, or a duplicated token makes every `/api` request answer 503
+  `auth_misconfigured` (and `serve` refuses to start), instead of silently falling back to the open local mode.
+- **[code]** Browser protections: no CORS by default (the app is same-origin; set `CORS_ORIGINS` only for a
+  separately hosted front end); requests whose `Origin` is another website are refused (CSRF); in no-token mode only
+  `localhost` Host headers are served (DNS rebinding). Security headers on every response (`nosniff`,
+  `X-Frame-Options: DENY`, `Referrer-Policy`, HSTS behind HTTPS) and a strict Content-Security-Policy on the app: its
+  inline router scripts are allowed by exact SHA-256 hash (computed from the built `index.html` the way the browser
+  parses it), no `'unsafe-inline'` scripts. Verified in headless Chrome with zero CSP violations.
+- **[code]** The audit identity comes from the token (`member:<tenant>`), not from a header the client sets.
 - **[code]** An MCP server process serves exactly one tenant (`MCP_TENANT`, set in the Hermes profile config, never
   by a prompt); its profit tools are read-only.
 - Limits: tokens are static shared secrets (no user accounts, rotation or expiry); no-token mode is single-user
@@ -47,7 +57,9 @@ can act: no AI path can send, approve, upload, delete, change settings or touch 
 | `MAX_USER_MESSAGE_CHARS` | 2000 | [code] longer questions rejected with HTTP 413 (advisor and guide) |
 | `MAX_SESSION_TOKENS` | 200000 | [code] per guide chat session (`X-Tahsila-Session`, scoped by tenant); checked before each call |
 | `RUN_LLM_CALL_CAP` / `DAILY_LLM_CALL_CAP` | 40 / 300 | [code] global call caps in the LLM client, reserved before each call (fail closed) |
-| `HERMES_TIMEOUT_S` | 300 | [code] the advisor caps a Hermes run at 240 s |
+| `TENANT_DAILY_LLM_CALL_CAP` | 40 | [code] per-business daily cap (advisor, guide and Hermes), so one business can't use up everyone's budget |
+| `HERMES_TIMEOUT_S` / `HERMES_MAX_CONCURRENT` | 300 / 2 | [code] the advisor caps a Hermes run at 120 s, counts it against the caps, and runs at most 2 at once |
+| `OUTREACH_DAILY_CAP` | 20 | [code] supplier emails per business per day (the platform can't be used as a mail relay) |
 | `LLM_PRICE_IN_PER_1K` / `LLM_PRICE_OUT_PER_1K` | 0 | [code] cost is **estimated only when you configure prices**; otherwise it is `null` |
 
 Every model call is logged with tokens and latency (`events` table, `llm_call`). When a budget is hit, a provider
@@ -73,13 +85,26 @@ most one call.
 
 ## 5. Data handling
 
-- **[code]** Uploads: type allowlist (CSV/XLSX/PDF), ≤10 MB, ≤20,000 rows per table, ≤500 chars per cell, ≤10 files
-  per request; values parsed and validated. Formula-looking text is stored as text, and every CSV export
+- **[code]** Uploads: type allowlist (CSV/XLSX/PDF), ≤10 MB per file and 25 MB per request (refused before reading),
+  ≤100,000 rows and ≤200 columns per table, ≤500 chars per cell, ≤10 files per request; an `.xlsx` is checked as a
+  zip first (≤100 MB unpacked, ≤200× compression, ≤20 sheets) so "zip bombs" are refused before openpyxl opens them;
+  parsing runs off the event loop. Values parsed and validated. Formula-looking text is stored as text, and every CSV export
   (metrics, guide feedback) is neutralised with `csv_safe`. Duplicate files are refused per investigation.
 - **[code]** Memory can only be written from owner confirmations or verified outcomes; retire = rollback.
-- Business data is sent to the configured LLM provider **only** by the advisor, only when a key is set (the computed
-  summary for the current question). The guide never sends business data. Without a key nothing leaves the machine
-  except SMTP sends you approve. Check your provider's own data terms.
+- **[code] AI consent per business** (`profit/ai_policy.py`, `GET/PUT /api/profit/ai-settings`): when several
+  businesses are hosted (`TENANT_TOKENS` set), nothing is sent to an AI provider until that business switches AI on
+  (default off; `PROFIT_AI_DEFAULT` overrides). Free-tier providers may log prompts or train on them, and Egypt's data
+  protection law (151/2020) restricts transfers abroad without consent. With AI off, answers come from the
+  calculations ("rules"). A self-hosted single business (no `TENANT_TOKENS`) is on by default (its own key).
+- When on, the advisor sends the computed summary (monthly totals and margins, product names with profit, findings,
+  plans, supplier request subjects) and the question; the guide sends in-investigation questions to the advisor and
+  other questions with the help text. **Never sent:** customer names/phones/emails (the optional customer column is
+  used only locally for win-back; tested), raw files, supplier email addresses.
+- **[code] Erase everything** (`DELETE /api/profit/my-data` with `{"confirm": "ERASE"}`, button in the Files tab):
+  removes the business's investigations, records, files, memory, settings, feedback, budgets and audit entries (one
+  content-free marker stays). `PRAGMA secure_delete` is on and the WAL is checkpointed, so erased rows are overwritten.
+  The database file is owner-only (0600). It is not encrypted: use an encrypted disk/volume in production.
+- **[code]** Replacing a file (column-mapping fix) removes the old version only after the new one imported.
 
 ## 6. Reliability
 
@@ -104,9 +129,14 @@ Outreach safety is covered in `tests/test_evidence_outreach.py`; upload validati
    has terminal/file/code/web toolsets enabled in this machine's Hermes config. One-shot mode auto-approves tool
    calls, so untrusted simulated replies could in principle drive those tools. Do not use `--engine hermes` for the
    lab until that profile is locked like the profit profile.
-3. **Static shared tokens**, no per-user identity or rate limiting per client; no encryption at rest (SQLite file).
-4. **Email** tested only with fake SMTP servers in this repository.
-5. **Cost** is estimated only from user-supplied prices; token ceilings can be exceeded by one call.
+3. **Static shared tokens**, no per-user accounts, login or rate limiting of failed tokens; no application-level
+   encryption at rest (use an encrypted volume). A real SaaS needs user accounts (e.g. phone/WhatsApp OTP) in front.
+4. **Shared worker threads:** a slow provider call (up to 75 s) holds a worker; per-business concurrency limits are
+   not enforced yet beyond the Hermes semaphore and the daily caps.
+5. **Email** tested only with fake SMTP servers in this repository.
+6. **Cost** is estimated only from user-supplied prices; token ceilings can be exceeded by one call.
+7. **MCP server** still exposes the simulation-lab tools in the same process as the read-only profit tools; run it
+   only on 127.0.0.1 or behind an authenticating proxy.
 
 ## Collections removal (2026-10-10)
 
